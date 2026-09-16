@@ -1,0 +1,13 @@
+{
+  "api_key": "your-api-key",
+  "base_url": "https://your-api-host/v1",
+  "model": "your-model-name",
+  "ocr_interval_ms": 1000,
+  "summary_sentence_count": 100,
+  "ocr_lang": "chi_sim",
+  "ocr_backend": "rapid",
+  "tesseract_path": "",
+  "auto_extract_key_info": true,
+  "summary_mode": "auto",
+  "theme": "light"
+}

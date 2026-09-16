@@ -1,0 +1,58 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+build_venv/
+
+# IDE / editor
+.idea/
+.vscode/
+.trae/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs & temp
+*.log
+_preview/
+_smoke_tmp/
+debug.log
+
+# Local secrets & runtime data (do not commit)
+config.json
+.env
+.env.*
+!.env.example
+records.db
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Build / packaging artifacts (auto-generated)
+build/
+dist/
+*.spec.bak
+
+# Keep release packaging specs; ignore ad-hoc test specs
+Test*.spec
+
+# Local notes / chat dumps
+*聊天记录*
+*测试游戏*

@@ -1,0 +1,13 @@
+PyQt6>=6.4.0
+Pillow>=9.0.0
+requests>=2.28.0
+numpy>=1.23.0,<2.0
+onnxruntime==1.18.1
+
+# OCR 后端，默认使用 RapidOCR
+rapidocr_onnxruntime>=1.1.0
+
+# 其他可选 OCR 后端
+# pytesseract>=0.3.9   # Tesseract OCR
+# winrt                # Windows 10/11 自带 OCR（Python 3.12 及以下可能可用）
+# paddleocr            # PaddleOCR，中文/日文识别率高，但 Windows 依赖较重
