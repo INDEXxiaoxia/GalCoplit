@@ -221,6 +221,20 @@ def make_card() -> QFrame:
     return frame
 
 
+class NoWheelSpinBox(QSpinBox):
+    """滚轮不改数值的整数输入框，避免滚动页面时误改配置。"""
+
+    def wheelEvent(self, event):
+        event.ignore()  # 交给滚动区处理，页面照常滚动
+
+
+class NoWheelDoubleSpinBox(QDoubleSpinBox):
+    """滚轮不改数值的小数输入框，避免滚动页面时误改配置。"""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 def make_hint(text: str) -> QLabel:
     """设置项下方的说明文字（含建议值）"""
     label = QLabel(text)
@@ -1419,18 +1433,18 @@ class SettingsPage(QWidget):
         self.cmb_ocr_lang.addItems(["chi_sim", "chi_tra", "eng", "jpn", "kor", "deu", "fra", "spa"])
         self.cmb_ocr_lang.setCurrentText(self.config.get("ocr_lang", "chi_sim"))
 
-        self.spin_ocr_interval = QSpinBox()
+        self.spin_ocr_interval = NoWheelSpinBox()
         self.spin_ocr_interval.setRange(200, 30000)
         self.spin_ocr_interval.setSuffix(" ms")
         self.spin_ocr_interval.setValue(self.config.get("ocr_interval_ms", 1500))
 
-        self.spin_det_limit = QSpinBox()
+        self.spin_det_limit = NoWheelSpinBox()
         self.spin_det_limit.setRange(320, 960)
         self.spin_det_limit.setSingleStep(32)
         self.spin_det_limit.setSuffix(" px")
         self.spin_det_limit.setValue(self.config.get("det_limit_side_len", 512))
 
-        self.spin_ocr_queue = QSpinBox()
+        self.spin_ocr_queue = NoWheelSpinBox()
         self.spin_ocr_queue.setRange(1, 20)
         self.spin_ocr_queue.setSuffix(" 帧")
         self.spin_ocr_queue.setValue(self.config.get("ocr_queue_size", 3))
@@ -1439,21 +1453,21 @@ class SettingsPage(QWidget):
         self.chk_queue_mode.setChecked(self.config.get("queue_mode", True))
         self.chk_queue_mode.toggled.connect(self._on_queue_mode_changed)
 
-        self.spin_queue_backlog = QSpinBox()
+        self.spin_queue_backlog = NoWheelSpinBox()
         self.spin_queue_backlog.setRange(20, 2000)
         self.spin_queue_backlog.setSingleStep(20)
         self.spin_queue_backlog.setSuffix(" 帧")
         self.spin_queue_backlog.setValue(self.config.get("queue_backlog_limit", 300))
         self.spin_queue_backlog.setToolTip("识别队列最多积压的帧数，超出后丢弃最旧的帧")
 
-        self.spin_frame_diff = QSpinBox()
+        self.spin_frame_diff = NoWheelSpinBox()
         self.spin_frame_diff.setRange(0, 64)
         self.spin_frame_diff.setValue(
             self.config.get("frame_diff_threshold", FRAME_DIFF_THRESHOLD)
         )
         self.spin_frame_diff.setToolTip("两张截图的 dHash 汉明距离，小于等于该值视为同一画面")
 
-        self.spin_text_sim = QDoubleSpinBox()
+        self.spin_text_sim = NoWheelDoubleSpinBox()
         self.spin_text_sim.setRange(0.50, 1.00)
         self.spin_text_sim.setSingleStep(0.05)
         self.spin_text_sim.setDecimals(2)
@@ -1462,7 +1476,7 @@ class SettingsPage(QWidget):
         )
         self.spin_text_sim.setToolTip("新识别文本与上一句的相似度达到该值时视为重复并丢弃")
 
-        self.spin_summary_count = QSpinBox()
+        self.spin_summary_count = NoWheelSpinBox()
         self.spin_summary_count.setRange(1, 999)
         self.spin_summary_count.setSuffix(" 句")
         self.spin_summary_count.setValue(self.config.get("summary_sentence_count", 50))
@@ -1502,25 +1516,23 @@ class SettingsPage(QWidget):
 
         layout.addRow("OCR 间隔:", self.spin_ocr_interval)
         layout.addRow(make_hint(
-            "每隔多久截一次图做比对。建议 1000 ms；文字逐字显示的游戏可调到 1500-2000 ms "
-            "减少无效识别，快速点击跳过对话时可调到 500-800 ms 避免漏句。"
+            "每隔多久截图比对一次。越大越省 CPU 但容易漏句，越小越不容易漏句但无效识别变多。"
+            "建议 500-2000 ms，默认 1000。"
         ))
         layout.addRow("检测分辨率:", self.spin_det_limit)
         layout.addRow(make_hint(
-            "文字检测时把截图缩放到的长边像素，越大越准但越慢。建议 512；"
-            "文字偏小或经常漏字时调到 640-768，追求速度可降到 384-448。"
+            "文字检测时缩放到的长边像素。越大越准但越慢，越小越快但小字容易漏。"
+            "建议 448-768 px，默认 512。"
         ))
         layout.addRow("画面差异阈值:", self.spin_frame_diff)
         layout.addRow(make_hint(
-            "两张截图的指纹差异（0-64），小于等于该值就认为是同一张图并跳过识别，"
-            "是省下无效 OCR 的关键。建议 3；对话框后面有动态立绘、雨雪特效导致反复识别同一句时，"
-            "调大到 5-8；翻页后没被识别到（漏句）时调小到 1-2。"
+            "判断两张截图是否算同一画面。越大越容易算同一张，跳过更多识别但可能漏句；"
+            "越小越敏感，识别更全但同一句可能重复识别。建议 1-8，默认 3。"
         ))
         layout.addRow("文本重复阈值:", self.spin_text_sim)
         layout.addRow(make_hint(
-            "识别结果与上一句的相似度达到该值就丢弃，用来滤掉逐字显示过程中的半截台词。"
-            "建议 0.85；同一句被重复记录多次时调低到 0.75-0.80，"
-            "连续出现的相似台词被误删时调高到 0.90-0.95。"
+            "判断识别结果与上一句是否算重复。越大越少判为重复，可能重复记录；"
+            "越小越易判为重复，可能误删相似台词。建议 0.75-0.95，默认 0.85。"
         ))
         layout.addRow(self.chk_queue_mode)
 
@@ -1530,7 +1542,8 @@ class SettingsPage(QWidget):
         legacy_queue_form.setContentsMargins(0, 0, 0, 0)
         legacy_queue_form.addRow("OCR 队列上限:", self.spin_ocr_queue)
         legacy_queue_form.addRow(make_hint(
-            "旧版管线的待识别帧上限，队列满了会丢掉最旧的帧。建议 3。"
+            "旧版管线的待识别帧上限，满了会丢掉最旧的帧。越大越能容忍识别慢，"
+            "越小越省内存但更容易丢帧。建议 1-5 帧，默认 3。"
         ))
         layout.addRow(self.legacy_queue_container)
 
@@ -1540,9 +1553,8 @@ class SettingsPage(QWidget):
         queue_backlog_form.setContentsMargins(0, 0, 0, 0)
         queue_backlog_form.addRow("队列积压上限:", self.spin_queue_backlog)
         queue_backlog_form.addRow(make_hint(
-            "识别队列最多积压多少帧，超出后丢弃最旧的帧（会在识别日志里提示）。"
-            "建议 300，够识别慢时追赶十几分钟的剧情；内存紧张可降到 100-150，"
-            "习惯长时间快速阅读后再总结可加到 500 以上。"
+            "识别队列最多积压多少帧，超出后丢弃最旧的帧。越大越能追赶长时间的积压，"
+            "越小越省内存但更容易丢帧。建议 100-500 帧，默认 300。"
         ))
         layout.addRow(self.queue_backlog_container)
 

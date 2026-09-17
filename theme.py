@@ -321,7 +321,7 @@ QPushButton[variant="ghost"]:hover { background-color: $btn_bg; color: $text; }
 QPushButton#PillBtn { padding: 3px 12px; border-radius: 6px; font-size: 12px; }
 
 /* ---------- 输入控件 ---------- */
-QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
+QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
     background-color: $input_bg;
     border: 1px solid $border;
     border-radius: 8px;
@@ -329,7 +329,7 @@ QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QComboBox {
     selection-background-color: $accent;
     selection-color: $sel_text;
 }
-QLineEdit:focus, QTextEdit:focus, QSpinBox:focus, QComboBox:focus { border-color: $accent; }
+QLineEdit:focus, QTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color: $accent; }
 QTextEdit { padding: 8px; }
 QLineEdit:read-only { color: $text_dim; }
 
@@ -376,16 +376,20 @@ QListView::item { padding: 6px 8px; border-radius: 4px; }
 QListView::item:hover { background-color: $btn_bg; }
 QListView::item:selected { background-color: $accent_soft; color: $text; }
 
-QSpinBox::up-button, QSpinBox::down-button { background: $btn_bg; border: none; width: 18px; }
-QSpinBox::up-button { border-top-right-radius: 8px; }
-QSpinBox::down-button { border-bottom-right-radius: 8px; }
-QSpinBox::up-button:hover, QSpinBox::down-button:hover { background: $btn_hover; }
-QSpinBox::up-arrow {
+QSpinBox::up-button, QSpinBox::down-button,
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+    background: $btn_bg; border: none; width: 18px;
+}
+QSpinBox::up-button, QDoubleSpinBox::up-button { border-top-right-radius: 8px; }
+QSpinBox::down-button, QDoubleSpinBox::down-button { border-bottom-right-radius: 8px; }
+QSpinBox::up-button:hover, QSpinBox::down-button:hover,
+QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover { background: $btn_hover; }
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
     image: none;
     border-left: 4px solid transparent; border-right: 4px solid transparent;
     border-bottom: 4px solid $text_faint;
 }
-QSpinBox::down-arrow {
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
     image: none;
     border-left: 4px solid transparent; border-right: 4px solid transparent;
     border-top: 4px solid $text_faint;
