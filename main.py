@@ -5,6 +5,8 @@ import time
 import datetime
 import threading
 import re
+from collections import deque
+from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any
 
 from PyQt6.QtWidgets import (
@@ -14,7 +16,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
     QInputDialog, QListWidget, QListWidgetItem, QSplitter, QCheckBox,
     QTabWidget, QFrame, QSizeGrip, QScrollArea, QStackedWidget, QButtonGroup,
-    QGridLayout, QAbstractItemView,
+    QGridLayout, QAbstractItemView, QProgressBar,
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QRect, QPoint, QTimer, QSize,
@@ -30,6 +32,7 @@ import theme
 from theme import apply_theme, status_visual, make_shadow
 from framecmp import (
     frame_hash, hamming_distance, text_similarity, FrameQueue,
+    FrameItem, FrameTaskQueue,
     FRAME_DIFF_THRESHOLD, TEXT_SIM_THRESHOLD,
 )
 
@@ -56,6 +59,8 @@ def _default_config() -> dict:
         "tesseract_path": "",
         "det_limit_side_len": 512,
         "ocr_queue_size": 3,
+        "queue_mode": True,
+        "queue_backlog_limit": 300,
         "auto_extract_key_info": True,
         "summary_mode": "auto",
         "theme": "light",
@@ -70,7 +75,7 @@ def _normalize_config(config: dict) -> dict:
     """
     int_keys = (
         "ocr_interval_ms", "summary_sentence_count", "det_limit_side_len",
-        "ocr_queue_size", "last_game_id", "last_route_id",
+        "ocr_queue_size", "queue_backlog_limit", "last_game_id", "last_route_id",
     )
     defaults = _default_config()
     for k in int_keys:
@@ -81,6 +86,11 @@ def _normalize_config(config: dict) -> dict:
                 config[k] = defaults.get(k)
     if isinstance(config.get("auto_extract_key_info"), str):
         config["auto_extract_key_info"] = config["auto_extract_key_info"].lower() == "true"
+    if isinstance(config.get("queue_mode"), str):
+        config["queue_mode"] = config["queue_mode"].lower() == "true"
+    config["queue_mode"] = bool(config.get("queue_mode", True))
+    if not isinstance(config.get("queue_backlog_limit"), int) or config["queue_backlog_limit"] < 20:
+        config["queue_backlog_limit"] = defaults["queue_backlog_limit"]
     if config.get("theme") not in ("dark", "light"):
         config["theme"] = "light"
     if config.get("ocr_backend") not in ("tesseract", "windows", "paddle", "rapid"):
@@ -557,6 +567,185 @@ class OCRWorker(QThread):
         self.wait(2000)
 
 
+class QueuedOCRWorker(QThread):
+    """队列模式（v1.1）识别线程：截图比对与 OCR 彻底解耦。
+
+    生产线程只做「截图 + dHash 比对」，画面变化即分配单调递增的 frame_id 入队；
+    消费循环持续追赶 OCR，每帧无论识别结果是否被去重都上报完成，
+    使剧情总结可以用 frame_id 作为锚点等待某一段全部识别完成。
+    """
+
+    # frame_id, 已入队总数
+    frame_enqueued = pyqtSignal(int, int)
+    # frame_id, 识别文本（被去重时为空）, 已完成总数, 已入队总数, 待识别数
+    frame_recognized = pyqtSignal(int, str, int, int, int)
+    # 因积压溢出被丢弃的 frame_id, 累计丢弃数
+    frame_dropped = pyqtSignal(int, int)
+    error = pyqtSignal(str)
+
+    def __init__(self, region: dict, interval_ms: int, lang: str, tesseract_path: str,
+                 backend: str = "rapid", backlog_limit: int = 300, det_limit: int = 0,
+                 start_seq: int = 0):
+        super().__init__()
+        self.region = region
+        self.interval = interval_ms / 1000.0
+        self.lang = lang
+        self.tesseract_path = tesseract_path
+        self.backend = backend
+        self.backlog_limit = backlog_limit
+        self.det_limit = det_limit
+        self._running = False
+        self._bbox_lock = threading.Lock()
+        self._physical_bbox = _logical_bbox_to_physical(region)
+        self._queue = FrameTaskQueue(backlog_limit)
+
+        # 帧编号与完成水位；start_seq 让暂停后重新启动的帧号继续递增，不与旧帧冲突
+        self._stat_lock = threading.Lock()
+        self._start_seq = max(0, start_seq)
+        self._frame_seq = self._start_seq
+        self._last_enqueued_id = self._start_seq
+        self._prev_enqueued_id = self._start_seq
+        self._done_upto = 0
+        self._done_total = 0
+
+    def update_region(self, region: dict):
+        """运行时更新识别区域"""
+        with self._bbox_lock:
+            self.region = region
+            self._physical_bbox = _logical_bbox_to_physical(region)
+
+    # ------------------------------------------------------------------
+    # 进度与锚点查询（供 UI 线程调用，均加锁）
+    # ------------------------------------------------------------------
+    def latest_enqueued_frame_id(self) -> int:
+        """最新已入队帧编号；尚无帧时为 0。"""
+        with self._stat_lock:
+            return self._last_enqueued_id
+
+    def prev_enqueued_frame_id(self) -> int:
+        """最新已入队帧的前一帧编号，用作总结锚点。
+
+        只有一帧时退化为该帧本身，避免锚点为 0 导致空区间。
+        """
+        with self._stat_lock:
+            if self._prev_enqueued_id:
+                return self._prev_enqueued_id
+            return self._last_enqueued_id
+
+    def recognized_upto(self) -> int:
+        """已连续识别完成到的帧编号。"""
+        with self._stat_lock:
+            return self._done_upto
+
+    def frame_seq_high_water(self) -> int:
+        """本次运行分配到的最大帧编号，供下一个 worker 续号。"""
+        with self._stat_lock:
+            return self._frame_seq
+
+    def progress(self) -> tuple:
+        """返回本次运行的 (已识别, 已累计, 待识别, 已丢弃)。"""
+        pending, _enqueued, dropped = self._queue.stats()
+        with self._stat_lock:
+            return self._done_total, self._frame_seq - self._start_seq, pending, dropped
+
+    # ------------------------------------------------------------------
+    # 生产 / 消费
+    # ------------------------------------------------------------------
+    def _produce(self):
+        """生产线程：固定间隔截图，画面 dHash 变化才分配帧号入队（跳帧）"""
+        last_hash = 0
+        have_hash = False
+        while self._running:
+            try:
+                with self._bbox_lock:
+                    bbox = self._physical_bbox
+                pil_img = ImageGrab.grab(bbox=bbox)
+                h = frame_hash(pil_img)
+                if not have_hash or hamming_distance(h, last_hash) > FRAME_DIFF_THRESHOLD:
+                    last_hash = h
+                    have_hash = True
+                    with self._stat_lock:
+                        self._frame_seq += 1
+                        frame_id = self._frame_seq
+                        self._prev_enqueued_id = self._last_enqueued_id
+                        self._last_enqueued_id = frame_id
+                        enqueued_total = self._frame_seq - self._start_seq
+                    accepted, dropped_id = self._queue.put(FrameItem(frame_id=frame_id, img=pil_img))
+                    if dropped_id:
+                        # 被丢弃的帧永远不会被识别，需推进完成水位，避免锚点永久等待
+                        with self._stat_lock:
+                            if dropped_id > self._done_upto:
+                                self._done_upto = dropped_id
+                        self.frame_dropped.emit(dropped_id, self._queue.dropped)
+                    if accepted:
+                        self.frame_enqueued.emit(frame_id, enqueued_total)
+            except Exception as e:
+                self.error.emit(str(e))
+            time.sleep(self.interval)
+
+    def run(self):
+        set_tesseract_cmd(self.tesseract_path)
+        producer = threading.Thread(target=self._produce, daemon=True)
+        producer.start()
+
+        last_text = ""
+        while True:
+            item = self._queue.get()
+            if item is None:
+                break
+            text = ""
+            try:
+                raw = ocr_image(item.img, self.lang, backend=self.backend, det_limit=self.det_limit)
+                # 文本相似度去重：≥ 阈值视为重复，不重复进入剧情缓冲
+                if raw and (last_text == "" or text_similarity(raw, last_text) < TEXT_SIM_THRESHOLD):
+                    last_text = raw
+                    text = raw
+            except Exception as e:
+                self.error.emit(str(e))
+            # 无论识别结果是否被去重/失败，都必须上报完成，否则锚点水位会永久卡住
+            with self._stat_lock:
+                # 只前进不后退：生产者可能已因丢帧把水位推到更靠后的帧
+                if item.frame_id > self._done_upto:
+                    self._done_upto = item.frame_id
+                self._done_total += 1
+                done_total = self._done_total
+                enqueued_total = self._frame_seq - self._start_seq
+            self.frame_recognized.emit(
+                item.frame_id, text, done_total, enqueued_total, len(self._queue)
+            )
+
+    def start(self):
+        self._running = True
+        super().start()
+
+    def stop(self, drain: bool = False):
+        """停止识别。
+
+        drain=True：停止截图但让消费者把已入队帧全部识别完（暂停按钮），避免丢剧情。
+        drain=False：立即结束并丢弃未识别帧（切换区域、退出程序）。
+        """
+        self._running = False
+        if drain:
+            self._queue.seal()
+        else:
+            self._queue.close()
+            self.wait(2000)
+
+
+@dataclass
+class SummaryTask:
+    """队列模式（v1.1）的一次总结任务。
+
+    以 anchor_frame_id 为锚点，覆盖 (start_frame_id, anchor_frame_id] 这段帧的识别文本；
+    锚点及之前所有帧识别完成后才能送 LLM，用户连续阅读时多个任务按顺序排队。
+    """
+
+    anchor_frame_id: int
+    start_frame_id: int
+    session_id: Optional[int] = None
+    state: str = "等待识别"
+    created_at: datetime.datetime = field(default_factory=datetime.datetime.now)
+
 
 class SummaryThread(QThread):
     # summary, raw_text, key_info_list, title
@@ -845,6 +1034,8 @@ class StatusWindow(QWidget):
         self.setFixedSize(300, 48)
         self._drag_pos = None
         self._ocr_running = False
+        self._queue_mode = False
+        self._manual_mode = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(2, 2, 2, 2)
@@ -939,7 +1130,8 @@ class StatusWindow(QWidget):
             self.lbl_ocr_status.setText(status)
             color, blink = status_visual(status)
             self.dot_ocr.set_state(color, blink)
-        if current is not None:
+        if current is not None and not self._queue_mode:
+            # 队列模式下第二行改为显示识别进度，不再显示识别文本
             current = current.replace("\n", " ").replace("\r", " ").strip()
             display = current if len(current) <= 15 else current[:15] + "..."
             self.lbl_current.setText(display)
@@ -948,8 +1140,8 @@ class StatusWindow(QWidget):
         self.lbl_summary_status.setText(summary_status)
         color, blink = status_visual(summary_status)
         self.dot_summary.set_state(color, blink)
-        # 总结中时禁用总结按钮
-        if summary_status == "总结中":
+        # 总结中时禁用总结按钮；队列模式下可继续追加锚点任务，故保持可用
+        if summary_status == "总结中" and not self._queue_mode:
             self.btn_summarize.setEnabled(False)
         else:
             self.btn_summarize.setEnabled(True)
@@ -967,11 +1159,37 @@ class StatusWindow(QWidget):
             self.btn_toggle.setToolTip("继续识别")
 
     def set_manual_mode(self, enabled: bool):
-        self.lbl_count.setVisible(enabled)
-        self.btn_summarize.setVisible(enabled)
+        self._manual_mode = enabled
+        self._sync_manual_widgets()
+
+    def set_queue_mode(self, enabled: bool):
+        """队列模式（v1.1）：第二行显示识别进度，总结按钮常驻。"""
+        self._queue_mode = enabled
+        if enabled:
+            self.setFixedSize(340, 48)
+            self.lbl_current.setText("已识别/已累计：0/0")
+        else:
+            self.setFixedSize(300, 48)
+            self.lbl_current.setText("--")
+        self._sync_manual_widgets()
+
+    def _sync_manual_widgets(self):
+        # 队列模式下锚点总结是核心交互，auto/manual 都显示总结按钮与计数
+        show = self._manual_mode or self._queue_mode
+        self.lbl_count.setVisible(show)
+        self.btn_summarize.setVisible(show)
 
     def update_count(self, count: int):
         self.lbl_count.setText(f"{count} 句")
+
+    def update_queue_progress(self, done: int, total: int, summary_waiting: int):
+        """队列模式：显示 已识别/已累计 与待总结任务数。"""
+        if not self._queue_mode:
+            return
+        text = f"已识别/已累计：{done}/{total}"
+        if summary_waiting:
+            text += f"　待总结 {summary_waiting}"
+        self.lbl_current.setText(text)
 
 
 # ---------------------------------------------------------------------------
@@ -1029,6 +1247,17 @@ class SettingsPage(QWidget):
         self.spin_ocr_queue.setSuffix(" 帧")
         self.spin_ocr_queue.setValue(self.config.get("ocr_queue_size", 3))
 
+        self.chk_queue_mode = QCheckBox("队列模式（v1.1）：后台持续识别，总结按锚点排队")
+        self.chk_queue_mode.setChecked(self.config.get("queue_mode", True))
+        self.chk_queue_mode.toggled.connect(self._on_queue_mode_changed)
+
+        self.spin_queue_backlog = QSpinBox()
+        self.spin_queue_backlog.setRange(20, 2000)
+        self.spin_queue_backlog.setSingleStep(20)
+        self.spin_queue_backlog.setSuffix(" 帧")
+        self.spin_queue_backlog.setValue(self.config.get("queue_backlog_limit", 300))
+        self.spin_queue_backlog.setToolTip("识别队列最多积压的帧数，超出后丢弃最旧的帧")
+
         self.spin_summary_count = QSpinBox()
         self.spin_summary_count.setRange(1, 999)
         self.spin_summary_count.setSuffix(" 句")
@@ -1069,7 +1298,22 @@ class SettingsPage(QWidget):
 
         layout.addRow("OCR 间隔:", self.spin_ocr_interval)
         layout.addRow("检测分辨率:", self.spin_det_limit)
-        layout.addRow("OCR 队列上限:", self.spin_ocr_queue)
+        layout.addRow(self.chk_queue_mode)
+
+        # 旧管线的帧队列上限，仅关闭队列模式时可见
+        self.legacy_queue_container = QWidget()
+        legacy_queue_form = QFormLayout(self.legacy_queue_container)
+        legacy_queue_form.setContentsMargins(0, 0, 0, 0)
+        legacy_queue_form.addRow("OCR 队列上限:", self.spin_ocr_queue)
+        layout.addRow(self.legacy_queue_container)
+
+        # 队列模式的积压上限，仅开启队列模式时可见
+        self.queue_backlog_container = QWidget()
+        queue_backlog_form = QFormLayout(self.queue_backlog_container)
+        queue_backlog_form.setContentsMargins(0, 0, 0, 0)
+        queue_backlog_form.addRow("队列积压上限:", self.spin_queue_backlog)
+        layout.addRow(self.queue_backlog_container)
+
         layout.addRow("总结模式:", self.cmb_summary_mode)
 
         # 总结句数只在自动模式下显示
@@ -1083,6 +1327,7 @@ class SettingsPage(QWidget):
 
         self._on_backend_changed(self.cmb_ocr_backend.currentText())
         self._on_summary_mode_changed(self.cmb_summary_mode.currentText())
+        self._on_queue_mode_changed(self.chk_queue_mode.isChecked())
 
         btn_row = QHBoxLayout()
         self.lbl_saved_hint = QLabel("")
@@ -1104,6 +1349,10 @@ class SettingsPage(QWidget):
     def _on_summary_mode_changed(self, mode: str):
         self.summary_count_container.setVisible(mode == "auto")
 
+    def _on_queue_mode_changed(self, enabled: bool):
+        self.queue_backlog_container.setVisible(enabled)
+        self.legacy_queue_container.setVisible(not enabled)
+
     def _save(self):
         self.config["base_url"] = self.txt_base_url.text().strip()
         self.config["api_key"] = self.txt_api_key.text().strip()
@@ -1113,6 +1362,8 @@ class SettingsPage(QWidget):
         self.config["ocr_interval_ms"] = self.spin_ocr_interval.value()
         self.config["det_limit_side_len"] = self.spin_det_limit.value()
         self.config["ocr_queue_size"] = self.spin_ocr_queue.value()
+        self.config["queue_mode"] = self.chk_queue_mode.isChecked()
+        self.config["queue_backlog_limit"] = self.spin_queue_backlog.value()
         self.config["summary_sentence_count"] = self.spin_summary_count.value()
         self.config["ocr_backend"] = self.cmb_ocr_backend.currentText()
         self.config["summary_mode"] = self.cmb_summary_mode.currentText()
@@ -2060,7 +2311,7 @@ class MainWindow(QMainWindow):
         self.region_indicator.region_changed.connect(self._on_region_indicator_changed)
 
         self.region: Optional[dict] = self.config.get("region")
-        self.ocr_worker: Optional[OCRWorker] = None
+        self.ocr_worker = None
         self.summary_thread: Optional[SummaryThread] = None
 
         self.buffer_lock = threading.RLock()
@@ -2071,6 +2322,29 @@ class MainWindow(QMainWindow):
         self._last_session_id: Optional[int] = None
         self._pause_summary_pending = False
         self.manual_sentence_count = 0
+
+        # ---- 队列模式（v1.1）状态 ----
+        self._queue_mode = bool(self.config.get("queue_mode", True))
+        # 帧文本簿：(frame_id, text)，按锚点区间取用
+        self.frame_texts: list[tuple[int, str]] = []
+        self.summary_queue: deque = deque()
+        self._summary_task_log: list = []
+        self._current_summary_task: Optional[SummaryTask] = None
+        self._last_anchor_id = 0
+        # 连续完成水位：所有 <= _recognized_upto 的帧都已识别（或已确认丢弃）
+        self._recognized_upto = 0
+        self._recognized_ids: set = set()
+        self._frame_id_high_water = 0
+        self._frames_done = 0
+        self._frames_enqueued = 0
+        self._frames_dropped = 0
+        self._frame_seq_base = 0
+        self._draining = False
+        self._draining_workers: list = []
+        self._queue_route_id: Optional[int] = None
+        self._queue_timer = QTimer(self)
+        self._queue_timer.setInterval(500)
+        self._queue_timer.timeout.connect(self._on_queue_tick)
 
         self.current_game_id: Optional[int] = self.config.get("last_game_id")
         self.current_route_id: Optional[int] = self.config.get("last_route_id")
@@ -2086,6 +2360,8 @@ class MainWindow(QMainWindow):
         self.status_window.show()
         self.btn_status.setChecked(True)
         self.status_window.set_ocr_running(False)
+        self.status_window.set_queue_mode(self._queue_mode)
+        self.status_window.set_manual_mode(self.config.get("summary_mode", "auto") == "manual")
         self._set_summary_status("空闲")
         self.status_window.update_summary_state("空闲")
 
@@ -2347,6 +2623,36 @@ class MainWindow(QMainWindow):
 
         content.addLayout(stats_row)
 
+        # ---- 队列进度卡片（仅队列模式 v1.1） ----
+        self.card_queue = make_card()
+        qv = QVBoxLayout(self.card_queue)
+        qv.setContentsMargins(18, 12, 18, 12)
+        qv.setSpacing(6)
+        qv.addWidget(make_caption("队列进度 · QUEUE"))
+
+        self.lbl_queue_ocr = QLabel("已识别 / 已累计：0 / 0")
+        set_cls(self.lbl_queue_ocr, "floatSub")
+        qv.addWidget(self.lbl_queue_ocr)
+        self.bar_queue_ocr = QProgressBar()
+        self.bar_queue_ocr.setTextVisible(False)
+        self.bar_queue_ocr.setFixedHeight(6)
+        self.bar_queue_ocr.setRange(0, 1)
+        self.bar_queue_ocr.setValue(0)
+        qv.addWidget(self.bar_queue_ocr)
+
+        self.lbl_queue_summary = QLabel("总结任务：0 / 0")
+        set_cls(self.lbl_queue_summary, "floatSub")
+        qv.addWidget(self.lbl_queue_summary)
+        self.bar_queue_summary = QProgressBar()
+        self.bar_queue_summary.setTextVisible(False)
+        self.bar_queue_summary.setFixedHeight(6)
+        self.bar_queue_summary.setRange(0, 1)
+        self.bar_queue_summary.setValue(0)
+        qv.addWidget(self.bar_queue_summary)
+
+        content.addWidget(self.card_queue)
+        self.card_queue.setVisible(self._queue_mode)
+
         # ---- 实时监控卡片 ----
         monitor_card = make_card()
         mv = QVBoxLayout(monitor_card)
@@ -2379,6 +2685,20 @@ class MainWindow(QMainWindow):
         self.txt_log.setPlaceholderText("OCR 识别日志…")
         self.tabs.addTab(self.txt_summary, "实时总结")
         self.tabs.addTab(self.txt_log, "识别日志")
+
+        # 队列 tab：总结任务的锚点、帧区间与状态（仅队列模式）
+        self.tbl_queue = QTableWidget(0, 4)
+        self.tbl_queue.setHorizontalHeaderLabels(["锚点帧", "帧区间", "状态", "入队时间"])
+        self.tbl_queue.verticalHeader().setVisible(False)
+        self.tbl_queue.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.tbl_queue.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+        self.tbl_queue.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self._queue_tab_index = -1
+        if self._queue_mode:
+            self._queue_tab_index = self.tabs.addTab(self.tbl_queue, "总结队列")
+
         mv.addWidget(self.tabs, 1)
 
         content.addWidget(monitor_card, 1)
@@ -2603,6 +2923,33 @@ class MainWindow(QMainWindow):
         if new_theme != theme.MODE:
             apply_theme(QApplication.instance(), new_theme)
             self._refresh_theme()
+        self._apply_queue_mode_setting()
+
+    def _apply_queue_mode_setting(self):
+        """队列模式开关变化后同步界面；正在识别时下次启动才生效。"""
+        new_mode = bool(self.config.get("queue_mode", True))
+        if new_mode == self._queue_mode:
+            self.status_window.set_manual_mode(
+                self.config.get("summary_mode", "auto") == "manual"
+            )
+            return
+        if self.ocr_worker is not None or self._draining:
+            self.txt_log.append("[队列] 队列模式开关已保存，将在下次开始识别时生效")
+            return
+        self._queue_mode = new_mode
+        self._reset_queue_state()
+        self._queue_route_id = None
+        self.card_queue.setVisible(new_mode)
+        if new_mode:
+            if self._queue_tab_index < 0:
+                self._queue_tab_index = self.tabs.addTab(self.tbl_queue, "总结队列")
+        elif self._queue_tab_index >= 0:
+            self.tabs.removeTab(self._queue_tab_index)
+            self._queue_tab_index = -1
+        self.status_window.set_queue_mode(new_mode)
+        self.status_window.set_manual_mode(
+            self.config.get("summary_mode", "auto") == "manual"
+        )
 
     def _refresh_theme(self):
         """主题切换后刷新依赖代码着色的部分（QSS 部分自动生效）"""
@@ -2693,18 +3040,42 @@ class MainWindow(QMainWindow):
         self.status_window.set_manual_mode(self.config.get("summary_mode", "auto") == "manual")
 
         self.txt_log.append("开始 OCR 识别...")
-        self.ocr_worker = OCRWorker(
-            self.region,
-            self.config.get("ocr_interval_ms", 1500),
-            self.config.get("ocr_lang", "chi_sim"),
-            self.config.get("tesseract_path", ""),
-            self.config.get("ocr_backend", "rapid"),
-            queue_size=int(self.config.get("ocr_queue_size", 3)),
-            det_limit=int(self.config.get("det_limit_side_len", 512)),
-        )
-        self.ocr_worker.text_ready.connect(self._on_ocr_text)
-        self.ocr_worker.error.connect(self._on_ocr_error)
-        self.ocr_worker.start()
+        if self._queue_mode:
+            # 换线路才清空；同线路暂停后继续时保留未总结的帧文本与排队任务
+            if self._queue_route_id != self.current_route_id:
+                self._reset_queue_state()
+            self._queue_route_id = self.current_route_id
+            self.ocr_worker = QueuedOCRWorker(
+                self.region,
+                self.config.get("ocr_interval_ms", 1500),
+                self.config.get("ocr_lang", "chi_sim"),
+                self.config.get("tesseract_path", ""),
+                self.config.get("ocr_backend", "rapid"),
+                backlog_limit=int(self.config.get("queue_backlog_limit", 300)),
+                det_limit=int(self.config.get("det_limit_side_len", 512)),
+                start_seq=self._frame_seq_base,
+            )
+            self.ocr_worker.frame_enqueued.connect(self._on_frame_enqueued)
+            self.ocr_worker.frame_recognized.connect(self._on_frame_recognized)
+            self.ocr_worker.frame_dropped.connect(self._on_frame_dropped)
+            self.ocr_worker.error.connect(self._on_ocr_error)
+            self.ocr_worker.start()
+            self._draining = False
+            self._queue_timer.start()
+            self._update_queue_ui()
+        else:
+            self.ocr_worker = OCRWorker(
+                self.region,
+                self.config.get("ocr_interval_ms", 1500),
+                self.config.get("ocr_lang", "chi_sim"),
+                self.config.get("tesseract_path", ""),
+                self.config.get("ocr_backend", "rapid"),
+                queue_size=int(self.config.get("ocr_queue_size", 3)),
+                det_limit=int(self.config.get("det_limit_side_len", 512)),
+            )
+            self.ocr_worker.text_ready.connect(self._on_ocr_text)
+            self.ocr_worker.error.connect(self._on_ocr_error)
+            self.ocr_worker.start()
 
         self.btn_start.setEnabled(False)
         self.btn_stop.setEnabled(True)
@@ -2717,7 +3088,25 @@ class MainWindow(QMainWindow):
         self.status_window.set_ocr_running(True)
 
     def _stop_ocr(self):
-        if self.ocr_worker:
+        drained = False
+        if isinstance(self.ocr_worker, QueuedOCRWorker):
+            worker = self.ocr_worker
+            self._frame_seq_base = max(self._frame_seq_base, worker.frame_seq_high_water())
+            _done, _total, pending, _dropped = worker.progress()
+            worker.stop(drain=True)
+            self.ocr_worker = None
+            if worker.isRunning():
+                # 让消费者把已入队的帧识别完，避免暂停时丢剧情
+                self._draining_workers.append(worker)
+                worker.finished.connect(self._on_drain_worker_finished)
+                if pending or self.summary_queue or self._summarizing:
+                    drained = True
+                    self._draining = True
+                    self._queue_timer.start()
+                    self.txt_log.append(f"[队列] 暂停截图，正在识别剩余 {pending} 帧…")
+            if not drained:
+                self._queue_timer.stop()
+        elif self.ocr_worker:
             self.ocr_worker.stop()
             self.ocr_worker = None
 
@@ -2734,9 +3123,12 @@ class MainWindow(QMainWindow):
         self.cmb_game.setEnabled(True)
         self.cmb_route.setEnabled(True)
         self.gameroute_page.setEnabled(True)
-        self._set_status("已暂停")
-        self.status_window.update_state(status="已暂停")
+        status = "排空中" if drained else "已暂停"
+        self._set_status(status)
+        self.status_window.update_state(status=status)
         self.status_window.set_ocr_running(False)
+        if self._queue_mode:
+            self._update_queue_ui()
 
     # ------------------------------------------------------------------
     # OCR 文本处理与总结触发
@@ -2798,6 +3190,269 @@ class MainWindow(QMainWindow):
     def _on_ocr_error(self, msg: str):
         self.txt_log.append(f"[OCR错误] {msg}")
 
+    # ------------------------------------------------------------------
+    # 队列模式（v1.1）：帧文本簿、锚点水位与总结任务队列
+    # ------------------------------------------------------------------
+    def _reset_queue_state(self):
+        """切换线路或切换模式时清空帧文本簿、任务队列与进度计数。"""
+        with self.buffer_lock:
+            self.frame_texts = []
+        self.summary_queue.clear()
+        self._summary_task_log = []
+        self._current_summary_task = None
+        self._last_anchor_id = 0
+        self._recognized_upto = 0
+        self._recognized_ids = set()
+        self._frame_id_high_water = 0
+        self._frames_done = 0
+        self._frames_enqueued = 0
+        self._frames_dropped = 0
+        self._frame_seq_base = 0
+
+    def _advance_recognized_water(self, frame_id: int):
+        """推进连续完成水位：只有 1..N 全部有结果时水位才到 N。"""
+        if frame_id <= self._recognized_upto:
+            return
+        self._recognized_ids.add(frame_id)
+        while (self._recognized_upto + 1) in self._recognized_ids:
+            self._recognized_upto += 1
+            self._recognized_ids.discard(self._recognized_upto)
+
+    def _forget_frames_upto(self, frame_id: int):
+        """放弃 frame_id 及之前尚未识别的帧（立即停止时调用），避免锚点永久等待。"""
+        if frame_id > self._recognized_upto:
+            self._recognized_upto = frame_id
+            self._recognized_ids = {f for f in self._recognized_ids if f > frame_id}
+
+    def _on_frame_enqueued(self, frame_id: int, enqueued_total: int):
+        self._frames_enqueued += 1
+        if frame_id > self._frame_id_high_water:
+            self._frame_id_high_water = frame_id
+        self._update_queue_ui()
+
+    def _on_frame_dropped(self, frame_id: int, dropped_total: int):
+        self._frames_dropped = dropped_total
+        self._advance_recognized_water(frame_id)
+        if dropped_total == 1 or dropped_total % 20 == 0:
+            self.txt_log.append(
+                f"[队列] 积压超过上限，已丢弃最旧帧 {frame_id}（累计丢弃 {dropped_total} 帧），"
+                f"可提高设置中的「队列积压上限」或放慢阅读速度"
+            )
+        self._update_queue_ui()
+        self._pump_summary_queue()
+
+    def _on_frame_recognized(self, frame_id: int, text: str, done_total: int,
+                             enqueued_total: int, pending: int):
+        """队列模式下每帧识别完成的回调（替代 _on_ocr_text）。"""
+        self._frames_done += 1
+        if frame_id > self._frame_id_high_water:
+            self._frame_id_high_water = frame_id
+        self._advance_recognized_water(frame_id)
+
+        if text:
+            now_str = datetime.datetime.now().strftime("%H:%M:%S")
+            self.txt_current.setText(text)
+            self.txt_log.append(f"[{now_str}] [帧{frame_id}] {text}")
+            with self.buffer_lock:
+                self.frame_texts.append((frame_id, text))
+
+        # 未总结区间的句数：既用于显示，也用于 auto 模式触发
+        with self.buffer_lock:
+            pending_text = "\n".join(
+                t for fid, t in self.frame_texts if fid > self._last_anchor_id and t
+            )
+        self.manual_sentence_count = self._count_sentences(pending_text)
+        self.status_window.update_count(self.manual_sentence_count)
+
+        if self.config.get("summary_mode", "auto") == "auto":
+            if self.manual_sentence_count >= self.config.get("summary_sentence_count", 50):
+                self._enqueue_summary_task(anchor_frame_id=frame_id)
+
+        self._update_queue_ui()
+        self._pump_summary_queue()
+
+    def _enqueue_summary_task(self, anchor_frame_id: Optional[int] = None) -> bool:
+        """以「点击瞬间最新已入队帧的前一帧」为锚点，把一段剧情加入总结队列。"""
+        if anchor_frame_id is not None:
+            anchor = anchor_frame_id
+        elif isinstance(self.ocr_worker, QueuedOCRWorker):
+            anchor = self.ocr_worker.prev_enqueued_frame_id()
+        else:
+            # 识别已停止：把已知的所有帧都纳入本次总结
+            anchor = self._frame_id_high_water
+
+        if anchor <= self._last_anchor_id:
+            self.txt_log.append("[队列] 自上次总结锚点以来没有新画面，忽略本次总结请求")
+            return False
+
+        task = SummaryTask(
+            anchor_frame_id=anchor,
+            start_frame_id=self._last_anchor_id,
+            session_id=self._current_session_id or self._last_session_id,
+        )
+        self._last_anchor_id = anchor
+        self.summary_queue.append(task)
+        self._summary_task_log.append(task)
+        self.txt_log.append(
+            f"[队列] 已加入总结任务：帧 {task.start_frame_id + 1}-{anchor}"
+            f"（当前已识别至帧 {self._recognized_upto}）"
+        )
+        self._pump_summary_queue()
+        self._update_queue_ui()
+        return True
+
+    def _take_frame_texts(self, start_frame_id: int, anchor_frame_id: int) -> str:
+        """取出 (start, anchor] 区间的识别文本，并裁掉锚点及之前的帧记录。"""
+        with self.buffer_lock:
+            picked = sorted(
+                (fid, t) for fid, t in self.frame_texts
+                if start_frame_id < fid <= anchor_frame_id and t
+            )
+            self.frame_texts = [
+                (fid, t) for fid, t in self.frame_texts if fid > anchor_frame_id
+            ]
+        return "\n".join(t for _fid, t in picked)
+
+    def _pump_summary_queue(self):
+        """调度总结队列：锚点及之前全部识别完成后才串行发起总结。"""
+        if not self._queue_mode or self._summarizing:
+            return
+        while self.summary_queue:
+            task = self.summary_queue[0]
+            if task.anchor_frame_id > self._recognized_upto:
+                task.state = "等待识别"
+                self._update_queue_ui()
+                return
+            self.summary_queue.popleft()
+            text = self._take_frame_texts(task.start_frame_id, task.anchor_frame_id)
+            if not text.strip():
+                task.state = "已跳过"
+                self.txt_log.append(
+                    f"[队列] 帧 {task.start_frame_id + 1}-{task.anchor_frame_id} 无有效文本，跳过总结"
+                )
+                continue
+            task.state = "总结中"
+            self._current_summary_task = task
+            self._start_queued_summary(text, task.session_id)
+            self._update_queue_ui()
+            return
+        self._update_queue_ui()
+
+    def _start_queued_summary(self, text: str, session_id: Optional[int]):
+        """队列模式下发起一次总结（锚点即段落边界，不再切分最后一句）。"""
+        self._summary_session_id = session_id or self._current_session_id or self._last_session_id
+        self._summarizing = True
+        # 队列模式下总结按钮保持可用：用户读得快时要能继续追加锚点任务
+        self._set_summary_status("总结中")
+        self.status_window.update_summary_state("总结中")
+        self.summary_thread = SummaryThread(
+            self.llm_client,
+            text,
+            self.previous_summary,
+            auto_extract=self.config.get("auto_extract_key_info", True),
+            extra_prompt=self._game_prompt(),
+        )
+        self.summary_thread.summary_ready.connect(self._on_summary_ready)
+        self.summary_thread.error.connect(self._on_summary_error)
+        self.summary_thread.finished.connect(self._on_summary_thread_finished)
+        self.summary_thread.start()
+
+    def _on_queue_tick(self):
+        """定时兜底：刷新进度并推进队列（信号漏触发时也能恢复）。"""
+        self._update_queue_ui()
+        self._pump_summary_queue()
+        if self._draining and not self._queue_pending_frames() and not self.summary_queue \
+                and not self._summarizing:
+            self._finish_draining()
+
+    def _queue_pending_frames(self) -> int:
+        """当前识别线程与排空中线程的待识别帧总数。"""
+        total = 0
+        workers = list(self._draining_workers)
+        if isinstance(self.ocr_worker, QueuedOCRWorker):
+            workers.append(self.ocr_worker)
+        for worker in workers:
+            _done, _enqueued, pending, _dropped = worker.progress()
+            total += pending
+        return total
+
+    def _summary_queue_waiting(self) -> int:
+        """排队中的总结任务数（含正在总结的那个）。"""
+        return len(self.summary_queue) + (1 if self._current_summary_task and self._summarizing else 0)
+
+    def _finish_draining(self):
+        """暂停后队列排空且总结跑完：恢复为已暂停状态。"""
+        self._draining = False
+        self._queue_timer.stop()
+        self._set_status("已暂停")
+        self.status_window.update_state(status="已暂停")
+        self.txt_log.append("[队列] 剩余画面已全部识别完成")
+        self._update_queue_ui()
+
+    def _on_drain_worker_finished(self):
+        """排空中的识别线程结束后释放引用。"""
+        worker = self.sender()
+        if worker in self._draining_workers:
+            self._draining_workers.remove(worker)
+
+    def _update_queue_ui(self):
+        """刷新浮窗与主界面的识别/总结队列进度。"""
+        if not self._queue_mode or not hasattr(self, "lbl_queue_ocr"):
+            return
+        total = max(0, self._frames_enqueued - self._frames_dropped)
+        done = min(self._frames_done, total)
+        pending = max(0, total - done)
+
+        self.bar_queue_ocr.setMaximum(max(1, total))
+        self.bar_queue_ocr.setValue(done)
+        ocr_text = f"已识别 / 已累计：{done} / {total}"
+        if pending:
+            ocr_text += f"　待识别 {pending}"
+        if self._frames_dropped:
+            ocr_text += f"　已丢弃 {self._frames_dropped}"
+        self.lbl_queue_ocr.setText(ocr_text)
+
+        task_total = len(self._summary_task_log)
+        task_done = sum(
+            1 for t in self._summary_task_log if t.state in ("已完成", "已跳过", "失败")
+        )
+        waiting = self._summary_queue_waiting()
+        self.bar_queue_summary.setMaximum(max(1, task_total))
+        self.bar_queue_summary.setValue(task_done)
+        summary_text = f"总结任务：{task_done} / {task_total}"
+        if waiting:
+            head = self.summary_queue[0] if self.summary_queue else None
+            if self._summarizing:
+                summary_text += f"　排队 {waiting}　当前总结中"
+            elif head is not None and head.anchor_frame_id > self._recognized_upto:
+                summary_text += (
+                    f"　排队 {waiting}　等待识别至帧 {head.anchor_frame_id}"
+                    f"（当前 {self._recognized_upto}）"
+                )
+            else:
+                summary_text += f"　排队 {waiting}"
+        self.lbl_queue_summary.setText(summary_text)
+
+        self.status_window.update_queue_progress(done, total, waiting)
+        self._refresh_queue_table()
+
+    def _refresh_queue_table(self):
+        if not hasattr(self, "tbl_queue"):
+            return
+        tasks = self._summary_task_log[-50:]
+        self.tbl_queue.setRowCount(len(tasks))
+        for row, task in enumerate(tasks):
+            values = [
+                str(task.anchor_frame_id),
+                f"{task.start_frame_id + 1} - {task.anchor_frame_id}",
+                task.state,
+                task.created_at.strftime("%H:%M:%S"),
+            ]
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.tbl_queue.setItem(row, col, item)
+
     def _game_prompt(self) -> str:
         """当前游戏的追加提示词（总结/信息提取时拼入 system prompt）"""
         if not self.current_game_id:
@@ -2837,6 +3492,10 @@ class MainWindow(QMainWindow):
         self.summary_thread.start()
 
     def _manual_summarize(self):
+        if self._queue_mode:
+            # 队列模式：以点击瞬间的锚点入队，等该段识别完成后再总结
+            self._enqueue_summary_task()
+            return
         if not self.text_buffer:
             return
         self._trigger_summary()
@@ -2885,6 +3544,9 @@ class MainWindow(QMainWindow):
         self._summarizing = False
         self.btn_summarize_main.setEnabled(True)
         self.previous_summary = summary
+        if self._current_summary_task is not None:
+            self._current_summary_task.state = "已完成"
+            self._current_summary_task = None
 
         # 持久化总结
         summary_id = None
@@ -2938,9 +3600,19 @@ class MainWindow(QMainWindow):
         elif self.stack.currentIndex() == 2:
             self.keyinfo_page.reload()
 
-        # 保留当前缓冲区中的最后一句供下次总结使用，句数同步更新
-        self.manual_sentence_count = self._count_sentences("\n".join(self.text_buffer))
-        self.status_window.update_count(self.manual_sentence_count)
+        if self._queue_mode:
+            # 锚点即段落边界，剩余未总结区间的句数按帧文本簿重算
+            with self.buffer_lock:
+                pending_text = "\n".join(
+                    t for fid, t in self.frame_texts if fid > self._last_anchor_id and t
+                )
+            self.manual_sentence_count = self._count_sentences(pending_text)
+            self.status_window.update_count(self.manual_sentence_count)
+            self._pump_summary_queue()
+        else:
+            # 保留当前缓冲区中的最后一句供下次总结使用，句数同步更新
+            self.manual_sentence_count = self._count_sentences("\n".join(self.text_buffer))
+            self.status_window.update_count(self.manual_sentence_count)
 
     def _show_summary_done(self):
         """在主界面和浮窗中显示总结完成反馈"""
@@ -2952,10 +3624,15 @@ class MainWindow(QMainWindow):
     def _on_summary_error(self, msg: str):
         self._summarizing = False
         self.btn_summarize_main.setEnabled(True)
+        if self._current_summary_task is not None:
+            self._current_summary_task.state = "失败"
+            self._current_summary_task = None
         self.txt_summary.append(f"[总结错误] {msg}")
         self._set_summary_status("总结失败")
         self.status_window.update_summary_state("总结失败")
         QTimer.singleShot(2000, self._restore_running_status)
+        if self._queue_mode:
+            self._pump_summary_queue()
 
     def _on_summary_thread_finished(self):
         """总结线程结束后清理引用，避免对象累积"""
@@ -2966,11 +3643,19 @@ class MainWindow(QMainWindow):
         """总结结束后根据 OCR 是否仍在运行恢复状态显示"""
         running = self.ocr_worker is not None and self.ocr_worker.isRunning()
         self.status_window.set_ocr_running(running)
-        self.status_window.update_summary_state("空闲")
-        self._set_summary_status("空闲")
+        if self._summarizing:
+            # 队列中的下一个任务已经开始，不要把状态改回空闲
+            self.status_window.update_summary_state("总结中")
+            self._set_summary_status("总结中")
+        else:
+            self.status_window.update_summary_state("空闲")
+            self._set_summary_status("空闲")
         if running:
             self._set_status("识别中")
             self.status_window.update_state(status="识别中")
+        elif self._draining:
+            self._set_status("排空中")
+            self.status_window.update_state(status="排空中")
         else:
             self._set_status("已暂停")
             self.status_window.update_state(status="已暂停")
@@ -2986,7 +3671,37 @@ class MainWindow(QMainWindow):
     # 关闭
     # ------------------------------------------------------------------
     def closeEvent(self, event):
-        if self.ocr_worker and self.ocr_worker.isRunning():
+        if self._queue_mode:
+            pending_frames = self._queue_pending_frames()
+            waiting_tasks = self._summary_queue_waiting()
+            if pending_frames or waiting_tasks:
+                reply = QMessageBox.question(
+                    self,
+                    "仍有未完成的任务",
+                    f"还有 {pending_frames} 帧待识别、{waiting_tasks} 个总结任务未完成。\n"
+                    "现在退出会丢弃这些内容，确定退出吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    event.ignore()
+                    return
+        self._queue_timer.stop()
+        # 退出时立即结束识别线程（含仍在排空的），不再等待队列
+        had_worker = self.ocr_worker is not None
+        workers = list(self._draining_workers)
+        self._draining_workers.clear()
+        if isinstance(self.ocr_worker, QueuedOCRWorker):
+            workers.append(self.ocr_worker)
+            self.ocr_worker = None
+        for worker in workers:
+            try:
+                worker.stop(drain=False)
+            except Exception:
+                pass
+        self._draining = False
+        if had_worker:
+            # 收尾：结束会话、更新时长、恢复按钮状态（旧模式的 worker 也在此停止）
             self._stop_ocr()
         event.accept()
 

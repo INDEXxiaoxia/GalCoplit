@@ -9,5 +9,7 @@
   "tesseract_path": "",
   "auto_extract_key_info": true,
   "summary_mode": "auto",
+  "queue_mode": true,
+  "queue_backlog_limit": 300,
   "theme": "light"
 }

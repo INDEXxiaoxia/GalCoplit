@@ -465,7 +465,7 @@ def status_visual(text: str) -> tuple:
     """根据状态文本返回 (指示灯颜色, 是否呼吸闪烁)"""
     if "总结中" in text:
         return CURRENT["warn"], True
-    if "识别中" in text or "测试中" in text:
+    if "识别中" in text or "测试中" in text or "排空" in text:
         return CURRENT["accent"], True
     if "暂停" in text:
         return CURRENT["danger"], False

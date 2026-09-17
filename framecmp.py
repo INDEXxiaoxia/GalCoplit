@@ -4,7 +4,10 @@
 以及识别文本相似度去重，避免重复文本反复进入剧情缓冲。
 """
 import threading
+import time
 from collections import deque
+from dataclasses import dataclass, field
+from typing import Optional
 
 from PIL import Image
 
@@ -104,6 +107,98 @@ class FrameQueue:
         with self._cond:
             self._closed = True
             self._cond.notify_all()
+
+    def __len__(self) -> int:
+        with self._cond:
+            return len(self._buf)
+
+
+# ---------------------------------------------------------------------------
+# 带帧编号的识别任务队列（v1.1 队列模式）
+# ---------------------------------------------------------------------------
+@dataclass
+class FrameItem:
+    """一个待识别帧：帧编号 + 图像 + 入队时间戳。
+
+    frame_id 由生产者单调递增分配，用于剧情总结的锚点定位。
+    """
+
+    frame_id: int
+    img: Image.Image
+    ts: float = field(default_factory=time.monotonic)
+
+
+class FrameTaskQueue:
+    """线程安全有界 FIFO 帧任务队列（v1.1）。
+
+    与 FrameQueue 的区别：
+    - 元素是携带 frame_id 的 FrameItem，可用于锚点定位；
+    - 统计已入队总数与因积压溢出而丢弃的帧数，便于 UI 显式提示；
+    - 除 close（立即结束）外提供 seal（禁止入队但允许消费者排空剩余帧）。
+    """
+
+    def __init__(self, maxlen: int):
+        self._max = max(1, maxlen)
+        self._buf: deque = deque()
+        self._cond = threading.Condition()
+        self._closed = False
+        self._sealed = False
+        self._enqueued = 0
+        self._dropped = 0
+
+    def put(self, item: FrameItem) -> tuple:
+        """入队一帧。
+
+        返回 (是否入队成功, 因积压溢出被丢弃的帧编号)。队列已封口/关闭时返回 (False, 0)。
+        被丢弃的帧编号必须上报，否则锚点的连续完成水位会永久停在该帧。
+        """
+        if item is None:
+            return False, 0
+        with self._cond:
+            if self._closed or self._sealed:
+                return False, 0
+            dropped_id = 0
+            if len(self._buf) >= self._max:
+                dropped_id = self._buf.popleft().frame_id  # 积压溢出：丢最旧
+                self._dropped += 1
+            self._buf.append(item)
+            self._enqueued += 1
+            self._cond.notify()
+            return True, dropped_id
+
+    def get(self) -> Optional[FrameItem]:
+        """阻塞取一帧；关闭时立即返回 None，封口且已排空时返回 None。"""
+        with self._cond:
+            while not self._buf and not self._closed and not self._sealed:
+                self._cond.wait()
+            if self._closed:
+                return None
+            if self._buf:
+                return self._buf.popleft()
+            return None
+
+    def seal(self) -> None:
+        """封口：不再接受新帧，但消费者仍可把已入队的帧全部取完。"""
+        with self._cond:
+            self._sealed = True
+            self._cond.notify_all()
+
+    def close(self) -> None:
+        """立即关闭：丢弃未消费帧并唤醒消费者。"""
+        with self._cond:
+            self._closed = True
+            self._buf.clear()
+            self._cond.notify_all()
+
+    def stats(self) -> tuple:
+        """返回 (待识别帧数, 已入队总数, 已丢弃帧数)。"""
+        with self._cond:
+            return len(self._buf), self._enqueued, self._dropped
+
+    @property
+    def dropped(self) -> int:
+        with self._cond:
+            return self._dropped
 
     def __len__(self) -> int:
         with self._cond:
