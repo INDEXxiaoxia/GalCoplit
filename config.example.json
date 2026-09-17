@@ -11,5 +11,7 @@
   "summary_mode": "auto",
   "queue_mode": true,
   "queue_backlog_limit": 300,
+  "frame_diff_threshold": 3,
+  "text_similarity_threshold": 0.85,
   "theme": "light"
 }

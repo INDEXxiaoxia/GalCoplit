@@ -12,7 +12,7 @@ from typing import Optional, List, Dict, Any
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QMessageBox, QRubberBand, QLineEdit,
-    QDialog, QFormLayout, QSpinBox,
+    QDialog, QFormLayout, QSpinBox, QDoubleSpinBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
     QInputDialog, QListWidget, QListWidgetItem, QSplitter, QCheckBox,
     QTabWidget, QFrame, QSizeGrip, QScrollArea, QStackedWidget, QButtonGroup,
@@ -22,7 +22,7 @@ from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QRect, QPoint, QTimer, QSize,
     QPropertyAnimation, QEasingCurve, QMimeData,
 )
-from PyQt6.QtGui import QGuiApplication, QTextCursor, QTextBlockFormat, QDrag
+from PyQt6.QtGui import QGuiApplication, QTextCursor, QTextBlockFormat, QDrag, QCursor
 from PIL import Image, ImageGrab
 
 from ocr_engine import set_tesseract_cmd, ocr_image, ocr_image_extended
@@ -61,6 +61,8 @@ def _default_config() -> dict:
         "ocr_queue_size": 3,
         "queue_mode": True,
         "queue_backlog_limit": 300,
+        "frame_diff_threshold": FRAME_DIFF_THRESHOLD,
+        "text_similarity_threshold": TEXT_SIM_THRESHOLD,
         "auto_extract_key_info": True,
         "summary_mode": "auto",
         "theme": "light",
@@ -75,7 +77,8 @@ def _normalize_config(config: dict) -> dict:
     """
     int_keys = (
         "ocr_interval_ms", "summary_sentence_count", "det_limit_side_len",
-        "ocr_queue_size", "queue_backlog_limit", "last_game_id", "last_route_id",
+        "ocr_queue_size", "queue_backlog_limit", "frame_diff_threshold",
+        "last_game_id", "last_route_id",
     )
     defaults = _default_config()
     for k in int_keys:
@@ -91,6 +94,19 @@ def _normalize_config(config: dict) -> dict:
     config["queue_mode"] = bool(config.get("queue_mode", True))
     if not isinstance(config.get("queue_backlog_limit"), int) or config["queue_backlog_limit"] < 20:
         config["queue_backlog_limit"] = defaults["queue_backlog_limit"]
+    # 画面差异阈值：dHash 汉明距离，合法范围 0..64
+    fdt = config.get("frame_diff_threshold", defaults["frame_diff_threshold"])
+    if not isinstance(fdt, int) or not 0 <= fdt <= 64:
+        fdt = defaults["frame_diff_threshold"]
+    config["frame_diff_threshold"] = fdt
+    # 文本重复阈值：相似度 0.50..1.00
+    try:
+        tst = float(config.get("text_similarity_threshold", defaults["text_similarity_threshold"]))
+    except (ValueError, TypeError):
+        tst = defaults["text_similarity_threshold"]
+    if not 0.5 <= tst <= 1.0:
+        tst = defaults["text_similarity_threshold"]
+    config["text_similarity_threshold"] = round(tst, 2)
     if config.get("theme") not in ("dark", "light"):
         config["theme"] = "light"
     if config.get("ocr_backend") not in ("tesseract", "windows", "paddle", "rapid"):
@@ -203,6 +219,15 @@ def make_card() -> QFrame:
     frame = QFrame()
     frame.setProperty("card", True)
     return frame
+
+
+def make_hint(text: str) -> QLabel:
+    """设置项下方的说明文字（含建议值）"""
+    label = QLabel(text)
+    set_cls(label, "dim")
+    label.setWordWrap(True)
+    label.setStyleSheet("font-size: 11px; padding: 0px 0px 2px 2px;")
+    return label
 
 
 def make_caption(text: str) -> QLabel:
@@ -500,7 +525,9 @@ class OCRWorker(QThread):
     text_ready = pyqtSignal(str)
     error = pyqtSignal(str)
 
-    def __init__(self, region: dict, interval_ms: int, lang: str, tesseract_path: str, backend: str = "rapid", queue_size: int = 3, det_limit: int = 0):
+    def __init__(self, region: dict, interval_ms: int, lang: str, tesseract_path: str, backend: str = "rapid", queue_size: int = 3, det_limit: int = 0,
+                 frame_diff_threshold: int = FRAME_DIFF_THRESHOLD,
+                 text_sim_threshold: float = TEXT_SIM_THRESHOLD):
         super().__init__()
         self.region = region
         self.interval = interval_ms / 1000.0
@@ -509,6 +536,8 @@ class OCRWorker(QThread):
         self.backend = backend
         self.queue_size = queue_size
         self.det_limit = det_limit
+        self.frame_diff_threshold = frame_diff_threshold
+        self.text_sim_threshold = text_sim_threshold
         self._running = False
         self._bbox_lock = threading.Lock()
         self._physical_bbox = _logical_bbox_to_physical(region)
@@ -530,7 +559,7 @@ class OCRWorker(QThread):
                     bbox = self._physical_bbox
                 pil_img = ImageGrab.grab(bbox=bbox)
                 h = frame_hash(pil_img)
-                if not have_hash or hamming_distance(h, last_hash) > FRAME_DIFF_THRESHOLD:
+                if not have_hash or hamming_distance(h, last_hash) > self.frame_diff_threshold:
                     last_hash = h
                     have_hash = True
                     self._queue.put(pil_img)
@@ -551,7 +580,7 @@ class OCRWorker(QThread):
             try:
                 text = ocr_image(pil_img, self.lang, backend=self.backend, det_limit=self.det_limit)
                 # 文本相似度去重：≥ 阈值视为重复，不重复进入剧情缓冲
-                if text and (last_text == "" or text_similarity(text, last_text) < TEXT_SIM_THRESHOLD):
+                if text and (last_text == "" or text_similarity(text, last_text) < self.text_sim_threshold):
                     last_text = text
                     self.text_ready.emit(text)
             except Exception as e:
@@ -585,7 +614,9 @@ class QueuedOCRWorker(QThread):
 
     def __init__(self, region: dict, interval_ms: int, lang: str, tesseract_path: str,
                  backend: str = "rapid", backlog_limit: int = 300, det_limit: int = 0,
-                 start_seq: int = 0):
+                 start_seq: int = 0,
+                 frame_diff_threshold: int = FRAME_DIFF_THRESHOLD,
+                 text_sim_threshold: float = TEXT_SIM_THRESHOLD):
         super().__init__()
         self.region = region
         self.interval = interval_ms / 1000.0
@@ -594,6 +625,8 @@ class QueuedOCRWorker(QThread):
         self.backend = backend
         self.backlog_limit = backlog_limit
         self.det_limit = det_limit
+        self.frame_diff_threshold = frame_diff_threshold
+        self.text_sim_threshold = text_sim_threshold
         self._running = False
         self._bbox_lock = threading.Lock()
         self._physical_bbox = _logical_bbox_to_physical(region)
@@ -661,7 +694,7 @@ class QueuedOCRWorker(QThread):
                     bbox = self._physical_bbox
                 pil_img = ImageGrab.grab(bbox=bbox)
                 h = frame_hash(pil_img)
-                if not have_hash or hamming_distance(h, last_hash) > FRAME_DIFF_THRESHOLD:
+                if not have_hash or hamming_distance(h, last_hash) > self.frame_diff_threshold:
                     last_hash = h
                     have_hash = True
                     with self._stat_lock:
@@ -697,7 +730,7 @@ class QueuedOCRWorker(QThread):
             try:
                 raw = ocr_image(item.img, self.lang, backend=self.backend, det_limit=self.det_limit)
                 # 文本相似度去重：≥ 阈值视为重复，不重复进入剧情缓冲
-                if raw and (last_text == "" or text_similarity(raw, last_text) < TEXT_SIM_THRESHOLD):
+                if raw and (last_text == "" or text_similarity(raw, last_text) < self.text_sim_threshold):
                     last_text = raw
                     text = raw
             except Exception as e:
@@ -1193,6 +1226,161 @@ class StatusWindow(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# 消息提示（Toast）
+# ---------------------------------------------------------------------------
+class Toast(QWidget):
+    """屏幕角落的浮动提示：几秒后自动淡出，也可手动点关闭。
+
+    独立置顶小窗而非主窗口内的控件，这样全屏玩游戏时也能看到提示。
+    """
+
+    dismissed = pyqtSignal(object)
+
+    def __init__(self, text: str, kind: str = "info", duration_ms: int = 4000):
+        super().__init__()
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint
+            | Qt.WindowType.WindowStaysOnTopHint
+            | Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self._duration_ms = max(1000, duration_ms)
+        self._closing = False
+        # 悬停最多延后这么久，保证提示不会因为鼠标恰好停在上面就一直不消失
+        self._hover_grace_ms = 6000
+        self._hover_waited_ms = 0
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(2, 2, 2, 2)
+        frame = QFrame()
+        frame.setObjectName("ToastFrame")
+        outer.addWidget(frame)
+        self._shadow = make_shadow(frame, blur=18, dy=3)
+
+        row = QHBoxLayout(frame)
+        row.setContentsMargins(12, 9, 8, 9)
+        row.setSpacing(8)
+
+        self.dot = PulseDot()
+        color_map = {
+            "info": theme.CURRENT["accent"],
+            "ok": theme.CURRENT["ok"],
+            "warn": theme.CURRENT["warn"],
+            "error": theme.CURRENT["danger"],
+        }
+        self.dot.set_state(color_map.get(kind, theme.CURRENT["accent"]), False)
+        row.addWidget(self.dot)
+
+        self.lbl = QLabel(text)
+        set_cls(self.lbl, "toastText")
+        self.lbl.setWordWrap(True)
+        self.lbl.setMinimumWidth(230)
+        row.addWidget(self.lbl, 1)
+
+        self.btn_close = QPushButton("✕")
+        self.btn_close.setObjectName("ToastClose")
+        self.btn_close.setToolTip("关闭提示")
+        self.btn_close.clicked.connect(self.dismiss)
+        row.addWidget(self.btn_close, 0, Qt.AlignmentFlag.AlignTop)
+
+        self.setFixedWidth(300)
+        self.adjustSize()
+
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._on_timeout)
+
+    def show_toast(self):
+        self.show()
+        self._fade = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade.setDuration(180)
+        self._fade.setStartValue(0.0)
+        self._fade.setEndValue(1.0)
+        self._fade.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._fade.start()
+        self._timer.start(self._duration_ms)
+
+    def _on_timeout(self):
+        # 鼠标停在提示上时延后关闭，方便看完长文本。
+        # 这里用光标坐标与窗口几何直接判断，不用 underMouse()/enter-leave 事件：
+        # 那套状态依赖事件成对送达，鼠标不动时会误判成一直悬停，提示就永远不消失。
+        step_ms = 800
+        if self._hover_waited_ms < self._hover_grace_ms \
+                and self.frameGeometry().contains(QCursor.pos()):
+            self._hover_waited_ms += step_ms
+            self._timer.start(step_ms)
+            return
+        self.dismiss()
+
+    def mousePressEvent(self, event):
+        self.dismiss()
+
+    def dismiss(self):
+        if self._closing:
+            return
+        self._closing = True
+        self._timer.stop()
+        self._fade_out = QPropertyAnimation(self, b"windowOpacity", self)
+        self._fade_out.setDuration(180)
+        self._fade_out.setStartValue(self.windowOpacity())
+        self._fade_out.setEndValue(0.0)
+        self._fade_out.setEasingCurve(QEasingCurve.Type.InCubic)
+        self._fade_out.finished.connect(self._finish)
+        self._fade_out.start()
+
+    def _finish(self):
+        self.dismissed.emit(self)
+        self.close()
+        self.deleteLater()
+
+
+class ToastManager:
+    """管理屏幕右下角的提示栈，新提示叠在上方，最多同时显示若干条。"""
+
+    MAX_VISIBLE = 4
+    MARGIN = 24
+    GAP = 8
+
+    def __init__(self):
+        self._toasts: list = []
+
+    def show(self, text: str, kind: str = "info", duration_ms: int = 4000):
+        while len(self._toasts) >= self.MAX_VISIBLE:
+            self._toasts[0].dismiss()
+            if self._toasts and self._toasts[0] in self._toasts:
+                self._toasts.pop(0)
+        toast = Toast(text, kind=kind, duration_ms=duration_ms)
+        toast.dismissed.connect(self._on_dismissed)
+        self._toasts.append(toast)
+        toast.show_toast()
+        self._reposition()
+        return toast
+
+    def _on_dismissed(self, toast):
+        if toast in self._toasts:
+            self._toasts.remove(toast)
+        self._reposition()
+
+    def _reposition(self):
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        area = screen.availableGeometry()
+        y = area.bottom() - self.MARGIN
+        # 最新的提示贴近屏幕底部，旧的往上堆叠
+        for toast in reversed(self._toasts):
+            y -= toast.height()
+            toast.move(area.right() - self.MARGIN - toast.width(), y)
+            y -= self.GAP
+
+    def clear(self):
+        for toast in list(self._toasts):
+            toast.dismiss()
+        self._toasts.clear()
+
+
+# ---------------------------------------------------------------------------
 # 设置页面
 # ---------------------------------------------------------------------------
 class SettingsPage(QWidget):
@@ -1258,6 +1446,22 @@ class SettingsPage(QWidget):
         self.spin_queue_backlog.setValue(self.config.get("queue_backlog_limit", 300))
         self.spin_queue_backlog.setToolTip("识别队列最多积压的帧数，超出后丢弃最旧的帧")
 
+        self.spin_frame_diff = QSpinBox()
+        self.spin_frame_diff.setRange(0, 64)
+        self.spin_frame_diff.setValue(
+            self.config.get("frame_diff_threshold", FRAME_DIFF_THRESHOLD)
+        )
+        self.spin_frame_diff.setToolTip("两张截图的 dHash 汉明距离，小于等于该值视为同一画面")
+
+        self.spin_text_sim = QDoubleSpinBox()
+        self.spin_text_sim.setRange(0.50, 1.00)
+        self.spin_text_sim.setSingleStep(0.05)
+        self.spin_text_sim.setDecimals(2)
+        self.spin_text_sim.setValue(
+            self.config.get("text_similarity_threshold", TEXT_SIM_THRESHOLD)
+        )
+        self.spin_text_sim.setToolTip("新识别文本与上一句的相似度达到该值时视为重复并丢弃")
+
         self.spin_summary_count = QSpinBox()
         self.spin_summary_count.setRange(1, 999)
         self.spin_summary_count.setSuffix(" 句")
@@ -1297,7 +1501,27 @@ class SettingsPage(QWidget):
         layout.addRow(self.tesseract_container)
 
         layout.addRow("OCR 间隔:", self.spin_ocr_interval)
+        layout.addRow(make_hint(
+            "每隔多久截一次图做比对。建议 1000 ms；文字逐字显示的游戏可调到 1500-2000 ms "
+            "减少无效识别，快速点击跳过对话时可调到 500-800 ms 避免漏句。"
+        ))
         layout.addRow("检测分辨率:", self.spin_det_limit)
+        layout.addRow(make_hint(
+            "文字检测时把截图缩放到的长边像素，越大越准但越慢。建议 512；"
+            "文字偏小或经常漏字时调到 640-768，追求速度可降到 384-448。"
+        ))
+        layout.addRow("画面差异阈值:", self.spin_frame_diff)
+        layout.addRow(make_hint(
+            "两张截图的指纹差异（0-64），小于等于该值就认为是同一张图并跳过识别，"
+            "是省下无效 OCR 的关键。建议 3；对话框后面有动态立绘、雨雪特效导致反复识别同一句时，"
+            "调大到 5-8；翻页后没被识别到（漏句）时调小到 1-2。"
+        ))
+        layout.addRow("文本重复阈值:", self.spin_text_sim)
+        layout.addRow(make_hint(
+            "识别结果与上一句的相似度达到该值就丢弃，用来滤掉逐字显示过程中的半截台词。"
+            "建议 0.85；同一句被重复记录多次时调低到 0.75-0.80，"
+            "连续出现的相似台词被误删时调高到 0.90-0.95。"
+        ))
         layout.addRow(self.chk_queue_mode)
 
         # 旧管线的帧队列上限，仅关闭队列模式时可见
@@ -1305,6 +1529,9 @@ class SettingsPage(QWidget):
         legacy_queue_form = QFormLayout(self.legacy_queue_container)
         legacy_queue_form.setContentsMargins(0, 0, 0, 0)
         legacy_queue_form.addRow("OCR 队列上限:", self.spin_ocr_queue)
+        legacy_queue_form.addRow(make_hint(
+            "旧版管线的待识别帧上限，队列满了会丢掉最旧的帧。建议 3。"
+        ))
         layout.addRow(self.legacy_queue_container)
 
         # 队列模式的积压上限，仅开启队列模式时可见
@@ -1312,6 +1539,11 @@ class SettingsPage(QWidget):
         queue_backlog_form = QFormLayout(self.queue_backlog_container)
         queue_backlog_form.setContentsMargins(0, 0, 0, 0)
         queue_backlog_form.addRow("队列积压上限:", self.spin_queue_backlog)
+        queue_backlog_form.addRow(make_hint(
+            "识别队列最多积压多少帧，超出后丢弃最旧的帧（会在识别日志里提示）。"
+            "建议 300，够识别慢时追赶十几分钟的剧情；内存紧张可降到 100-150，"
+            "习惯长时间快速阅读后再总结可加到 500 以上。"
+        ))
         layout.addRow(self.queue_backlog_container)
 
         layout.addRow("总结模式:", self.cmb_summary_mode)
@@ -1340,8 +1572,18 @@ class SettingsPage(QWidget):
         btn_row.addWidget(btn_save)
         card_layout.addLayout(btn_row)
 
-        page.addWidget(card)
-        page.addStretch()
+        # 设置项带说明后内容较长，放进滚动区避免小窗口下被裁掉
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        holder = QWidget()
+        holder_layout = QVBoxLayout(holder)
+        holder_layout.setContentsMargins(0, 0, 6, 0)
+        holder_layout.setSpacing(0)
+        holder_layout.addWidget(card)
+        holder_layout.addStretch()
+        scroll.setWidget(holder)
+        page.addWidget(scroll, 1)
 
     def _on_backend_changed(self, backend: str):
         self.tesseract_container.setVisible(backend == "tesseract")
@@ -1364,6 +1606,8 @@ class SettingsPage(QWidget):
         self.config["ocr_queue_size"] = self.spin_ocr_queue.value()
         self.config["queue_mode"] = self.chk_queue_mode.isChecked()
         self.config["queue_backlog_limit"] = self.spin_queue_backlog.value()
+        self.config["frame_diff_threshold"] = self.spin_frame_diff.value()
+        self.config["text_similarity_threshold"] = round(self.spin_text_sim.value(), 2)
         self.config["summary_sentence_count"] = self.spin_summary_count.value()
         self.config["ocr_backend"] = self.cmb_ocr_backend.currentText()
         self.config["summary_mode"] = self.cmb_summary_mode.currentText()
@@ -2304,6 +2548,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "数据库初始化失败", f"无法打开数据库：{e}\n请检查 records.db 是否损坏或无权访问。")
             raise
+        self.toasts = ToastManager()
         self.status_window = StatusWindow()
         self.status_window.summarize_requested.connect(self._manual_summarize)
         self.status_window.toggle_pause_requested.connect(self._toggle_ocr)
@@ -2380,7 +2625,15 @@ class MainWindow(QMainWindow):
                 loaded = json.load(f)
             merged = default.copy()
             merged.update(loaded)
-            return _normalize_config(merged)
+            merged = _normalize_config(merged)
+            # 旧版 config.json 直接换新版程序时，把新增配置项补写回文件
+            if any(k not in loaded for k in default):
+                try:
+                    with open(config_path, "w", encoding="utf-8") as f:
+                        json.dump(merged, f, ensure_ascii=False, indent=2)
+                except Exception:
+                    pass
+            return merged
         except Exception as e:
             QMessageBox.warning(
                 None,
@@ -3054,6 +3307,12 @@ class MainWindow(QMainWindow):
                 backlog_limit=int(self.config.get("queue_backlog_limit", 300)),
                 det_limit=int(self.config.get("det_limit_side_len", 512)),
                 start_seq=self._frame_seq_base,
+                frame_diff_threshold=int(
+                    self.config.get("frame_diff_threshold", FRAME_DIFF_THRESHOLD)
+                ),
+                text_sim_threshold=float(
+                    self.config.get("text_similarity_threshold", TEXT_SIM_THRESHOLD)
+                ),
             )
             self.ocr_worker.frame_enqueued.connect(self._on_frame_enqueued)
             self.ocr_worker.frame_recognized.connect(self._on_frame_recognized)
@@ -3072,6 +3331,12 @@ class MainWindow(QMainWindow):
                 self.config.get("ocr_backend", "rapid"),
                 queue_size=int(self.config.get("ocr_queue_size", 3)),
                 det_limit=int(self.config.get("det_limit_side_len", 512)),
+                frame_diff_threshold=int(
+                    self.config.get("frame_diff_threshold", FRAME_DIFF_THRESHOLD)
+                ),
+                text_sim_threshold=float(
+                    self.config.get("text_similarity_threshold", TEXT_SIM_THRESHOLD)
+                ),
             )
             self.ocr_worker.text_ready.connect(self._on_ocr_text)
             self.ocr_worker.error.connect(self._on_ocr_error)
@@ -3283,6 +3548,7 @@ class MainWindow(QMainWindow):
 
         if anchor <= self._last_anchor_id:
             self.txt_log.append("[队列] 自上次总结锚点以来没有新画面，忽略本次总结请求")
+            self.toasts.show("没有新画面，无需总结", kind="warn", duration_ms=3000)
             return False
 
         task = SummaryTask(
@@ -3297,6 +3563,18 @@ class MainWindow(QMainWindow):
             f"[队列] 已加入总结任务：帧 {task.start_frame_id + 1}-{anchor}"
             f"（当前已识别至帧 {self._recognized_upto}）"
         )
+
+        unread = max(0, anchor - self._recognized_upto)
+        waiting_before = len(self.summary_queue) - 1 + (1 if self._summarizing else 0)
+        tip = "已加入总结队列"
+        if unread:
+            tip += f"，还需识别 {unread} 帧"
+        else:
+            tip += "，本段已识别完成"
+        if waiting_before:
+            tip += f"；前面还有 {waiting_before} 个任务"
+        self.toasts.show(tip, kind="info")
+
         self._pump_summary_queue()
         self._update_queue_ui()
         return True
@@ -3330,6 +3608,7 @@ class MainWindow(QMainWindow):
                 self.txt_log.append(
                     f"[队列] 帧 {task.start_frame_id + 1}-{task.anchor_frame_id} 无有效文本，跳过总结"
                 )
+                self.toasts.show("这段没识别到文字，已跳过总结", kind="warn", duration_ms=4000)
                 continue
             task.state = "总结中"
             self._current_summary_task = task
@@ -3387,6 +3666,7 @@ class MainWindow(QMainWindow):
         self._set_status("已暂停")
         self.status_window.update_state(status="已暂停")
         self.txt_log.append("[队列] 剩余画面已全部识别完成")
+        self.toasts.show("剩余画面已全部识别完成", kind="ok", duration_ms=3000)
         self._update_queue_ui()
 
     def _on_drain_worker_finished(self):
@@ -3592,6 +3872,11 @@ class MainWindow(QMainWindow):
         self.txt_summary.append(f"[{now_str}] {summary}\n")
 
         # 总结完成反馈
+        chapter = title.strip() if title else ""
+        if chapter:
+            self.toasts.show(f"「{chapter}」已总结完成", kind="ok", duration_ms=5000)
+        else:
+            self.toasts.show("本段剧情已总结完成", kind="ok", duration_ms=5000)
         self._show_summary_done()
 
         # 若当前正在查看剧情总结 / 关键信息页面，实时刷新
@@ -3628,6 +3913,7 @@ class MainWindow(QMainWindow):
             self._current_summary_task.state = "失败"
             self._current_summary_task = None
         self.txt_summary.append(f"[总结错误] {msg}")
+        self.toasts.show(f"总结失败：{msg}", kind="error", duration_ms=6000)
         self._set_summary_status("总结失败")
         self.status_window.update_summary_state("总结失败")
         QTimer.singleShot(2000, self._restore_running_status)
@@ -3687,6 +3973,7 @@ class MainWindow(QMainWindow):
                     event.ignore()
                     return
         self._queue_timer.stop()
+        self.toasts.clear()
         # 退出时立即结束识别线程（含仍在排空的），不再等待队列
         had_worker = self.ocr_worker is not None
         workers = list(self._draining_workers)

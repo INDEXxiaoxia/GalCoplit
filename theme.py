@@ -162,6 +162,24 @@ QMessageBox, QInputDialog { background-color: $surface; }
 #DialogFrame { background-color: $bg; border: 1px solid $win_border; border-radius: 14px; }
 #FloatFrame { background-color: $surface; border: 1px solid $win_border; border-radius: 0px; }
 
+/* ---------- 消息提示（Toast） ---------- */
+#ToastFrame { background-color: $popup; border: 1px solid $win_border; border-radius: 10px; }
+QLabel[cls="toastText"] { color: $text; font-size: 12px; font-weight: 600; }
+QLabel[cls="toastSub"] { color: $text_dim; font-size: 11px; }
+QPushButton#ToastClose {
+    background: transparent; border: none; border-radius: 4px;
+    color: $text_faint; font-size: 13px; padding: 0;
+    min-width: 18px; max-width: 18px; min-height: 18px; max-height: 18px;
+}
+QPushButton#ToastClose:hover { background: $btn_hover; color: $text; }
+
+/* ---------- 进度条 ---------- */
+QProgressBar {
+    background-color: $input_bg; border: 1px solid $border;
+    border-radius: 3px; text-align: center;
+}
+QProgressBar::chunk { background-color: $accent; border-radius: 2px; }
+
 /* ---------- 标题栏 ---------- */
 #TitleBar {
     background-color: $titlebar;
