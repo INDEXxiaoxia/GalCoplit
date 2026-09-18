@@ -15,6 +15,10 @@ env/
 ENV/
 build_venv/
 
+# Optional Paddle OCR sidecar plugins (heavy, machine-local)
+paddle_ocr_cpu/
+paddle_ocr_gpu/
+
 # IDE / editor
 .idea/
 .vscode/

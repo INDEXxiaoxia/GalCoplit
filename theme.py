@@ -350,6 +350,16 @@ QComboBox::down-arrow {
     border-top: 5px solid $text_faint;
     margin-right: 8px;
 }
+/* 可编辑下拉：内部输入框去掉边框与自身 padding，避免与 Combo 的 padding 叠加裁切文字 */
+QComboBox QLineEdit {
+    border: none;
+    background: transparent;
+    padding: 0px;
+    margin: 0px;
+    min-height: 18px;
+    selection-background-color: $accent;
+    selection-color: $sel_text;
+}
 
 /* 下拉弹层：窗口本身由 polish_combo_popup 设为半透明，圆角由视图绘制 */
 QComboBoxPrivateContainer {

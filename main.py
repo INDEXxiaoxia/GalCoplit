@@ -20,12 +20,21 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import (
     Qt, QThread, pyqtSignal, QRect, QPoint, QTimer, QSize,
-    QPropertyAnimation, QEasingCurve, QMimeData,
+    QPropertyAnimation, QEasingCurve, QMimeData, QEvent, QCoreApplication,
 )
-from PyQt6.QtGui import QGuiApplication, QTextCursor, QTextBlockFormat, QDrag, QCursor
+from PyQt6.QtGui import QGuiApplication, QTextCursor, QTextBlockFormat, QDrag, QCursor, QIcon
 from PIL import Image, ImageGrab
 
-from ocr_engine import set_tesseract_cmd, ocr_image, ocr_image_extended
+from ocr_engine import (
+    set_tesseract_cmd,
+    ocr_image,
+    ocr_image_extended,
+    normalize_backend,
+    langs_for_backend,
+    resolve_ocr_lang,
+    OCR_LANG_LABELS,
+    DEFAULT_OCR_LANG,
+)
 from llm_client import LLMClient
 from recorder import Database
 import theme
@@ -35,6 +44,15 @@ from framecmp import (
     FrameItem, FrameTaskQueue,
     FRAME_DIFF_THRESHOLD, TEXT_SIM_THRESHOLD,
 )
+from paddle_plugin import (
+    BACKEND_CPU,
+    BACKEND_GPU,
+    backend_to_device,
+    environment_ready,
+    get_manager,
+    shutdown_all as shutdown_paddle_workers,
+)
+from setup_paddle_plugin import install_paddle_plugin
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +75,7 @@ def _default_config() -> dict:
         "ocr_lang": "chi_sim",
         "ocr_backend": "rapid",
         "tesseract_path": "",
-        "det_limit_side_len": 512,
+        "det_limit_side_len": 256,
         "ocr_queue_size": 3,
         "queue_mode": True,
         "queue_backlog_limit": 300,
@@ -69,12 +87,32 @@ def _default_config() -> dict:
     }
 
 
-def _normalize_config(config: dict) -> dict:
-    """数值/布尔类型归一化 + 非法值兜底。
+# OCR 后端：值写入 config，展示文案给用户看
+OCR_BACKEND_OPTIONS = [
+    ("rapid", "rapid(内置)"),
+    (BACKEND_CPU, "paddle-cpu(外置)"),
+    (BACKEND_GPU, "paddle-gpu(外置)"),
+    ("tesseract", "tesseract"),
+    ("windows", "windows"),
+]
+OCR_BACKEND_IDS = {item[0] for item in OCR_BACKEND_OPTIONS}
 
-    对齐 Go 版 normalizeConfig，但保留 py 现有的 tesseract/windows/paddle/rapid 四后端
-    （不把 windows/paddle 映射为 rapid）。
-    """
+OCR_BACKEND_HINTS = {
+    "rapid": "无需额外安装，速度适中。内置中文 PP-OCRv4。",
+    BACKEND_CPU: "固定 PP-OCRv6_small，通常快于 rapid；首次识别较慢，需额外安装。",
+    BACKEND_GPU: "固定 PP-OCRv6_small，速度最快；依赖 GPU/CUDA，首次识别较慢，需额外安装。",
+    "tesseract": "需本机安装 Tesseract，并填写下方路径。",
+    "windows": "使用系统自带 OCR，依赖 Windows 10/11 与 winrt。",
+}
+
+PADDLE_INSTALL_DOWNLOAD_HINT = {
+    "cpu": "已打开命令行窗口进行安装，需要下载约900MB文件。",
+    "gpu": "已打开命令行窗口进行安装，需要下载约2.33GB文件。",
+}
+
+
+def _normalize_config(config: dict) -> dict:
+    """数值/布尔类型归一化 + 非法值兜底。"""
     int_keys = (
         "ocr_interval_ms", "summary_sentence_count", "det_limit_side_len",
         "ocr_queue_size", "queue_backlog_limit", "frame_diff_threshold",
@@ -94,6 +132,11 @@ def _normalize_config(config: dict) -> dict:
     config["queue_mode"] = bool(config.get("queue_mode", True))
     if not isinstance(config.get("queue_backlog_limit"), int) or config["queue_backlog_limit"] < 20:
         config["queue_backlog_limit"] = defaults["queue_backlog_limit"]
+    # 检测分辨率：合法范围 64..800
+    det = config.get("det_limit_side_len", defaults["det_limit_side_len"])
+    if not isinstance(det, int) or not 64 <= det <= 800:
+        det = defaults["det_limit_side_len"]
+    config["det_limit_side_len"] = det
     # 画面差异阈值：dHash 汉明距离，合法范围 0..64
     fdt = config.get("frame_diff_threshold", defaults["frame_diff_threshold"])
     if not isinstance(fdt, int) or not 0 <= fdt <= 64:
@@ -109,12 +152,58 @@ def _normalize_config(config: dict) -> dict:
     config["text_similarity_threshold"] = round(tst, 2)
     if config.get("theme") not in ("dark", "light"):
         config["theme"] = "light"
-    if config.get("ocr_backend") not in ("tesseract", "windows", "paddle", "rapid"):
+    config["ocr_backend"] = normalize_backend(config.get("ocr_backend", "rapid"))
+    if config.get("ocr_backend") not in OCR_BACKEND_IDS:
         config["ocr_backend"] = "rapid"
+    config["ocr_lang"] = resolve_ocr_lang(
+        config["ocr_backend"], config.get("ocr_lang", DEFAULT_OCR_LANG)
+    )
     return config
 
 
 APP_DIR = _app_dir()
+
+
+def _resolve_icon_path() -> str:
+    """打包后从 exe 旁或 _MEIPASS 取 icon.ico，供窗口/任务栏显示。"""
+    bases = [APP_DIR]
+    if getattr(sys, "frozen", False):
+        meipass = getattr(sys, "_MEIPASS", "")
+        if meipass:
+            bases.append(meipass)
+        bases.append(os.path.dirname(sys.executable))
+    seen = set()
+    for base in bases:
+        if not base:
+            continue
+        path = os.path.normpath(os.path.join(base, "icon.ico"))
+        key = os.path.normcase(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if os.path.isfile(path):
+            return path
+    return ""
+
+
+def _apply_app_icon(app: QApplication, window: Optional[QMainWindow] = None) -> None:
+    """设置进程/窗口图标，并固定 Win 任务栏 AppUserModelID，避免显示成 Python 图标。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                "INDEXxiaoxia.GalCoplit"
+            )
+        except Exception:
+            pass
+    icon_path = _resolve_icon_path()
+    if not icon_path:
+        return
+    icon = QIcon(icon_path)
+    app.setWindowIcon(icon)
+    if window is not None:
+        window.setWindowIcon(icon)
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +240,9 @@ def export_route_markdown(db: Database, game_id: int, route_id: int, output_dir:
     lines.append("")
 
     lines.append("## 世界观")
+    lines.append("")
+    lines.append("> 本游戏各线路共享。设定冲突处标为「线路名线中原设定」。")
+    lines.append("")
     if world_infos:
         for item in world_infos:
             note = item.get("user_note") or ""
@@ -163,6 +255,9 @@ def export_route_markdown(db: Database, game_id: int, route_id: int, output_dir:
     lines.append("")
 
     lines.append("## 角色")
+    lines.append("")
+    lines.append("> 本游戏各线路共享。设定冲突处标为「线路名线中原设定」。")
+    lines.append("")
     if characters:
         for char in characters:
             info = char.get("info") or ""
@@ -175,6 +270,9 @@ def export_route_markdown(db: Database, game_id: int, route_id: int, output_dir:
     lines.append("")
 
     lines.append("## 线索")
+    lines.append("")
+    lines.append("> 本游戏各线路共享。设定冲突处标为「线路名线中原设定」。")
+    lines.append("")
     if clues:
         for item in clues:
             note = item.get("user_note") or ""
@@ -187,6 +285,9 @@ def export_route_markdown(db: Database, game_id: int, route_id: int, output_dir:
     lines.append("")
 
     lines.append("## 剧情总结")
+    lines.append("")
+    lines.append("> 仅包含当前线路。")
+    lines.append("")
     if summaries:
         for s in summaries:
             title = s.get("title") or "段落"
@@ -235,6 +336,57 @@ class NoWheelDoubleSpinBox(QDoubleSpinBox):
         event.ignore()
 
 
+class NoWheelComboBox(QComboBox):
+    """滚轮不切换选项的下拉框；下拉列表展开时仍可用滚轮浏览选项。"""
+
+    def setEditable(self, editable: bool):
+        super().setEditable(editable)
+        self._install_line_edit_wheel_filter()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._install_line_edit_wheel_filter()
+
+    def _install_line_edit_wheel_filter(self):
+        # 可编辑时 Qt 会在内部 LineEdit 上拦截滚轮改选项，必须在此过滤
+        le = self.lineEdit()
+        if le is None:
+            return
+        # 用 Qt property 标记，避免 sip 包装对象丢弃普通 Python 属性
+        if le.property("_nowheel_filtered"):
+            return
+        le.installEventFilter(self)
+        le.setProperty("_nowheel_filtered", True)
+
+    def eventFilter(self, watched, event):
+        if event.type() == QEvent.Type.Wheel and watched is self.lineEdit():
+            if self.view().isVisible():
+                return False
+            # 不改选项，把滚轮交给外层滚动区
+            scroll = self.parentWidget()
+            while scroll is not None:
+                if isinstance(scroll, QScrollArea):
+                    QCoreApplication.sendEvent(scroll.viewport(), event)
+                    break
+                scroll = scroll.parentWidget()
+            return True
+        return super().eventFilter(watched, event)
+
+    def wheelEvent(self, event):
+        # 列表已展开：允许滚动浏览；收起时忽略，避免滚动页面时误改选项
+        if self.view().isVisible():
+            super().wheelEvent(event)
+        else:
+            event.ignore()
+
+
+class NoWheelLineEdit(QLineEdit):
+    """滚轮不抢事件的输入框，交给外层滚动区处理页面滚动。"""
+
+    def wheelEvent(self, event):
+        event.ignore()
+
+
 def make_hint(text: str) -> QLabel:
     """设置项下方的说明文字（含建议值）"""
     label = QLabel(text)
@@ -259,9 +411,11 @@ def set_variant(button: QPushButton, variant: str):
 
 
 def make_combo(editable: bool = False) -> QComboBox:
-    combo = QComboBox()
+    combo = NoWheelComboBox()
     if editable:
         combo.setEditable(True)
+        # 不替换内部 QLineEdit：自定义 LineEdit 会套上全局 padding，文字被裁切。
+        combo._install_line_edit_wheel_filter()
     theme.polish_combo_popup(combo)
     return combo
 
@@ -799,13 +953,24 @@ class SummaryThread(QThread):
     summary_ready = pyqtSignal(str, str, str, str)
     error = pyqtSignal(str)
 
-    def __init__(self, client: LLMClient, text: str, previous_summary: str, auto_extract: bool = True, extra_prompt: str = ""):
+    def __init__(
+        self,
+        client: LLMClient,
+        text: str,
+        previous_summary: str,
+        auto_extract: bool = True,
+        extra_prompt: str = "",
+        shared_context: str = "",
+        current_route: str = "",
+    ):
         super().__init__()
         self.client = client
         self.text = text
         self.previous_summary = previous_summary
         self.auto_extract = auto_extract
         self.extra_prompt = extra_prompt
+        self.shared_context = shared_context
+        self.current_route = current_route
 
     def run(self):
         last_error = None
@@ -813,7 +978,13 @@ class SummaryThread(QThread):
         max_attempts = 4  # 首次 + 最多 3 次重试
         for attempt in range(max_attempts):
             try:
-                summary = self.client.summarize(self.text, self.previous_summary, extra_prompt=self.extra_prompt)
+                summary = self.client.summarize(
+                    self.text,
+                    self.previous_summary,
+                    extra_prompt=self.extra_prompt,
+                    shared_context=self.shared_context,
+                    current_route=self.current_route,
+                )
                 break
             except Exception as e:
                 last_error = e
@@ -830,7 +1001,13 @@ class SummaryThread(QThread):
         key_info = []
         if self.auto_extract:
             try:
-                key_info = self.client.extract_key_info(summary, self.text, extra_prompt=self.extra_prompt)
+                key_info = self.client.extract_key_info(
+                    summary,
+                    self.text,
+                    extra_prompt=self.extra_prompt,
+                    shared_context=self.shared_context,
+                    current_route=self.current_route,
+                )
             except Exception:
                 pass
         self.summary_ready.emit(summary, self.text, json.dumps(key_info, ensure_ascii=False), title)
@@ -1397,6 +1574,30 @@ class ToastManager:
 # ---------------------------------------------------------------------------
 # 设置页面
 # ---------------------------------------------------------------------------
+class InstallPaddleEnvThread(QThread):
+    """后台安装 paddle-cpu / paddle-gpu 旁路环境。"""
+
+    progress = pyqtSignal(str)
+    finished_ok = pyqtSignal()
+    finished_err = pyqtSignal(str)
+
+    def __init__(self, device: str, app_dir: str):
+        super().__init__()
+        self.device = device
+        self.app_dir = app_dir
+
+    def run(self):
+        try:
+            install_paddle_plugin(
+                self.device,
+                app_dir=self.app_dir,
+                log=lambda msg: self.progress.emit(str(msg)),
+            )
+            self.finished_ok.emit()
+        except Exception as e:
+            self.finished_err.emit(str(e))
+
+
 class SettingsPage(QWidget):
     """配置 LLM、OCR、主题等参数"""
 
@@ -1405,6 +1606,7 @@ class SettingsPage(QWidget):
     def __init__(self, config: dict, parent=None):
         super().__init__(parent)
         self.config = config
+        self._paddle_installing = False
         self._init_ui()
 
     def _init_ui(self):
@@ -1422,16 +1624,19 @@ class SettingsPage(QWidget):
         layout.setVerticalSpacing(12)
         layout.setHorizontalSpacing(16)
         card_layout.addLayout(layout)
+        self.form_layout = layout
 
-        self.txt_base_url = QLineEdit(self.config.get("base_url", ""))
-        self.txt_api_key = QLineEdit(self.config.get("api_key", ""))
+        self.txt_base_url = NoWheelLineEdit(self.config.get("base_url", ""))
+        self.txt_api_key = NoWheelLineEdit(self.config.get("api_key", ""))
         self.txt_api_key.setEchoMode(QLineEdit.EchoMode.Password)
-        self.txt_model = QLineEdit(self.config.get("model", ""))
-        self.txt_tesseract_path = QLineEdit(self.config.get("tesseract_path", ""))
+        self.txt_model = NoWheelLineEdit(self.config.get("model", ""))
+        self.txt_tesseract_path = NoWheelLineEdit(self.config.get("tesseract_path", ""))
 
-        self.cmb_ocr_lang = make_combo(editable=True)
-        self.cmb_ocr_lang.addItems(["chi_sim", "chi_tra", "eng", "jpn", "kor", "deu", "fra", "spa"])
-        self.cmb_ocr_lang.setCurrentText(self.config.get("ocr_lang", "chi_sim"))
+        self.cmb_ocr_lang = make_combo(editable=False)
+        self._refresh_ocr_lang_options(
+            normalize_backend(self.config.get("ocr_backend", "rapid")),
+            preferred=self.config.get("ocr_lang", DEFAULT_OCR_LANG),
+        )
 
         self.spin_ocr_interval = NoWheelSpinBox()
         self.spin_ocr_interval.setRange(200, 30000)
@@ -1439,19 +1644,19 @@ class SettingsPage(QWidget):
         self.spin_ocr_interval.setValue(self.config.get("ocr_interval_ms", 1500))
 
         self.spin_det_limit = NoWheelSpinBox()
-        self.spin_det_limit.setRange(320, 960)
+        self.spin_det_limit.setRange(64, 800)
         self.spin_det_limit.setSingleStep(32)
         self.spin_det_limit.setSuffix(" px")
-        self.spin_det_limit.setValue(self.config.get("det_limit_side_len", 512))
+        self.spin_det_limit.setValue(self.config.get("det_limit_side_len", 256))
 
         self.spin_ocr_queue = NoWheelSpinBox()
         self.spin_ocr_queue.setRange(1, 20)
         self.spin_ocr_queue.setSuffix(" 帧")
         self.spin_ocr_queue.setValue(self.config.get("ocr_queue_size", 3))
 
-        self.chk_queue_mode = QCheckBox("队列模式（v1.1）：后台持续识别，总结按锚点排队")
+        self.chk_queue_mode = QCheckBox("队列模式：后台持续识别，总结按锚点排队")
         self.chk_queue_mode.setChecked(self.config.get("queue_mode", True))
-        self.chk_queue_mode.toggled.connect(self._on_queue_mode_changed)
+        self.chk_queue_mode.toggled.connect(self._on_queue_mode_toggled)
 
         self.spin_queue_backlog = NoWheelSpinBox()
         self.spin_queue_backlog.setRange(20, 2000)
@@ -1482,9 +1687,12 @@ class SettingsPage(QWidget):
         self.spin_summary_count.setValue(self.config.get("summary_sentence_count", 50))
 
         self.cmb_ocr_backend = make_combo()
-        self.cmb_ocr_backend.addItems(["tesseract", "windows", "paddle", "rapid"])
-        self.cmb_ocr_backend.setCurrentText(self.config.get("ocr_backend", "rapid"))
-        self.cmb_ocr_backend.currentTextChanged.connect(self._on_backend_changed)
+        current_backend = normalize_backend(self.config.get("ocr_backend", "rapid"))
+        for backend_id, label in OCR_BACKEND_OPTIONS:
+            self.cmb_ocr_backend.addItem(label, backend_id)
+        idx = self.cmb_ocr_backend.findData(current_backend)
+        self.cmb_ocr_backend.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cmb_ocr_backend.currentIndexChanged.connect(self._on_backend_changed)
 
         self.cmb_summary_mode = make_combo()
         self.cmb_summary_mode.addItems(["auto", "manual"])
@@ -1505,6 +1713,25 @@ class SettingsPage(QWidget):
         layout.addRow("API Key:", self.txt_api_key)
         layout.addRow("模型:", self.txt_model)
         layout.addRow("OCR 后端:", self.cmb_ocr_backend)
+        self.lbl_ocr_backend_hint = make_hint("")
+        layout.addRow(self.lbl_ocr_backend_hint)
+
+        # Paddle：仅显示环境检测；未通过时右侧出现「安装环境」
+        self.paddle_plugin_container = QWidget()
+        paddle_row = QHBoxLayout(self.paddle_plugin_container)
+        paddle_row.setContentsMargins(0, 0, 0, 0)
+        paddle_row.setSpacing(10)
+        self.lbl_paddle_status = QLabel("环境检测：—")
+        set_cls(self.lbl_paddle_status, "dim")
+        self.lbl_paddle_status.setWordWrap(True)
+        paddle_row.addWidget(self.lbl_paddle_status, 1)
+        self.btn_install_paddle = QPushButton("安装环境")
+        set_variant(self.btn_install_paddle, "primary")
+        self.btn_install_paddle.clicked.connect(self._install_paddle_env)
+        self.btn_install_paddle.setVisible(False)
+        paddle_row.addWidget(self.btn_install_paddle, 0, Qt.AlignmentFlag.AlignRight)
+        layout.addRow(self.paddle_plugin_container)
+
         layout.addRow("OCR 语言:", self.cmb_ocr_lang)
 
         # Tesseract 路径单独放在一个容器里，方便显示/隐藏（包括前面的标签）
@@ -1521,8 +1748,8 @@ class SettingsPage(QWidget):
         ))
         layout.addRow("检测分辨率:", self.spin_det_limit)
         layout.addRow(make_hint(
-            "文字检测时缩放到的长边像素。越大越准但越慢，越小越快但小字容易漏。"
-            "建议 448-768 px，默认 512。"
+            "文字检测时缩放到的边长像素。越大越准但越慢，越小越快但小字容易漏。"
+            "建议 128-384 px，默认 256。对 rapid 与 paddle 均生效。"
         ))
         layout.addRow("画面差异阈值:", self.spin_frame_diff)
         layout.addRow(make_hint(
@@ -1536,27 +1763,23 @@ class SettingsPage(QWidget):
         ))
         layout.addRow(self.chk_queue_mode)
 
-        # 旧管线的帧队列上限，仅关闭队列模式时可见
-        self.legacy_queue_container = QWidget()
-        legacy_queue_form = QFormLayout(self.legacy_queue_container)
-        legacy_queue_form.setContentsMargins(0, 0, 0, 0)
-        legacy_queue_form.addRow("OCR 队列上限:", self.spin_ocr_queue)
-        legacy_queue_form.addRow(make_hint(
-            "旧版管线的待识别帧上限，满了会丢掉最旧的帧。越大越能容忍识别慢，"
-            "越小越省内存但更容易丢帧。建议 1-5 帧，默认 3。"
-        ))
-        layout.addRow(self.legacy_queue_container)
-
-        # 队列模式的积压上限，仅开启队列模式时可见
-        self.queue_backlog_container = QWidget()
-        queue_backlog_form = QFormLayout(self.queue_backlog_container)
-        queue_backlog_form.setContentsMargins(0, 0, 0, 0)
-        queue_backlog_form.addRow("队列积压上限:", self.spin_queue_backlog)
-        queue_backlog_form.addRow(make_hint(
+        # 直接放进主表单，和其它输入框共用列宽。
+        # 嵌套表单在「先隐藏再显示」时，QSpinBox 会被压成一条，改值后才撑开。
+        self._row_queue_backlog = layout.rowCount()
+        layout.addRow("队列积压上限:", self.spin_queue_backlog)
+        self._row_queue_backlog_hint = layout.rowCount()
+        layout.addRow(make_hint(
             "识别队列最多积压多少帧，超出后丢弃最旧的帧。越大越能追赶长时间的积压，"
             "越小越省内存但更容易丢帧。建议 100-500 帧，默认 300。"
         ))
-        layout.addRow(self.queue_backlog_container)
+
+        self._row_legacy_queue = layout.rowCount()
+        layout.addRow("OCR 队列上限:", self.spin_ocr_queue)
+        self._row_legacy_queue_hint = layout.rowCount()
+        layout.addRow(make_hint(
+            "旧版管线的待识别帧上限，满了会丢掉最旧的帧。越大越能容忍识别慢，"
+            "越小越省内存但更容易丢帧。建议 1-5 帧，默认 3。"
+        ))
 
         layout.addRow("总结模式:", self.cmb_summary_mode)
 
@@ -1569,7 +1792,7 @@ class SettingsPage(QWidget):
 
         layout.addRow(self.chk_auto_key_info)
 
-        self._on_backend_changed(self.cmb_ocr_backend.currentText())
+        self._on_backend_changed()
         self._on_summary_mode_changed(self.cmb_summary_mode.currentText())
         self._on_queue_mode_changed(self.chk_queue_mode.isChecked())
 
@@ -1597,21 +1820,150 @@ class SettingsPage(QWidget):
         scroll.setWidget(holder)
         page.addWidget(scroll, 1)
 
-    def _on_backend_changed(self, backend: str):
+    def _current_backend(self) -> str:
+        data = self.cmb_ocr_backend.currentData()
+        if isinstance(data, str) and data:
+            return data
+        return normalize_backend(self.cmb_ocr_backend.currentText())
+
+    def _refresh_ocr_lang_options(self, backend: str, preferred: str = ""):
+        """按 OCR 后端刷新语言下拉；无效语言回退中文简体。"""
+        langs = langs_for_backend(backend)
+        want = resolve_ocr_lang(backend, preferred or self.config.get("ocr_lang", DEFAULT_OCR_LANG))
+        self.cmb_ocr_lang.blockSignals(True)
+        self.cmb_ocr_lang.clear()
+        for code in langs:
+            label = OCR_LANG_LABELS.get(code, code)
+            self.cmb_ocr_lang.addItem(f"{label} ({code})", code)
+        idx = self.cmb_ocr_lang.findData(want)
+        self.cmb_ocr_lang.setCurrentIndex(idx if idx >= 0 else 0)
+        self.cmb_ocr_lang.blockSignals(False)
+        # Rapid 仅中文模型时禁用选择，避免误解
+        self.cmb_ocr_lang.setEnabled(len(langs) > 1)
+
+    def _current_ocr_lang(self) -> str:
+        data = self.cmb_ocr_lang.currentData()
+        if isinstance(data, str) and data:
+            return data
+        text = self.cmb_ocr_lang.currentText().strip()
+        # 兼容 "中文简体 (chi_sim)" 展示
+        if "(" in text and text.endswith(")"):
+            inner = text[text.rfind("(") + 1 : -1].strip()
+            if inner:
+                return inner
+        return text or DEFAULT_OCR_LANG
+
+    def _on_backend_changed(self, *_args):
+        backend = self._current_backend()
+        self.lbl_ocr_backend_hint.setText(
+            OCR_BACKEND_HINTS.get(backend, OCR_BACKEND_HINTS["rapid"])
+        )
         self.tesseract_container.setVisible(backend == "tesseract")
+        is_paddle = backend in (BACKEND_CPU, BACKEND_GPU)
+        self.paddle_plugin_container.setVisible(is_paddle)
+        self._refresh_ocr_lang_options(backend, preferred=self._current_ocr_lang())
+        if is_paddle:
+            self._refresh_paddle_status()
+        else:
+            self.btn_install_paddle.setVisible(False)
+
+    def _refresh_paddle_status(self):
+        backend = self._current_backend()
+        if backend not in (BACKEND_CPU, BACKEND_GPU):
+            self.lbl_paddle_status.setText("环境检测：—")
+            self.btn_install_paddle.setVisible(False)
+            return
+        if getattr(self, "_paddle_installing", False):
+            return
+        status = environment_ready(backend_to_device(backend), APP_DIR)
+        if status.installed:
+            self.lbl_paddle_status.setText("环境检测：已通过")
+            self.btn_install_paddle.setVisible(False)
+        else:
+            self.lbl_paddle_status.setText("环境检测：未通过")
+            self.btn_install_paddle.setVisible(True)
+            self.btn_install_paddle.setEnabled(True)
+            self.btn_install_paddle.setToolTip(status.detail)
+
+    def _install_paddle_env(self):
+        backend = self._current_backend()
+        if backend not in (BACKEND_CPU, BACKEND_GPU):
+            return
+        device = backend_to_device(backend)
+        tip = (
+            f"将安装 {backend} 旁路环境到：\n{os.path.join(APP_DIR, f'paddle_ocr_{device}')}\n\n"
+            "将固定安装 paddleocr 3.7 + PP-OCRv6_small。\n"
+            "若以前装过旧版，请先删除该目录再装。\n"
+            "体积较大，可能需要数分钟，期间请保持网络畅通。"
+        )
+        if device == "gpu":
+            tip += "\nGPU 版需本机已正确安装对应 CUDA。"
+        reply = QMessageBox.question(
+            self,
+            "安装 Paddle 环境",
+            tip + "\n\n确定开始安装吗？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self._paddle_installing = True
+        self.btn_install_paddle.setEnabled(False)
+        self.lbl_paddle_status.setText(
+            PADDLE_INSTALL_DOWNLOAD_HINT.get(device, PADDLE_INSTALL_DOWNLOAD_HINT["cpu"])
+        )
+        self._paddle_install_thread = InstallPaddleEnvThread(device, APP_DIR)
+        self._paddle_install_thread.finished_ok.connect(self._on_paddle_install_ok)
+        self._paddle_install_thread.finished_err.connect(self._on_paddle_install_err)
+        self._paddle_install_thread.start()
+
+    def _on_paddle_install_ok(self):
+        self._paddle_installing = False
+        self._refresh_paddle_status()
+        QMessageBox.information(self, "安装完成", "Paddle 环境已安装，环境检测已通过。")
+
+    def _on_paddle_install_err(self, msg: str):
+        self._paddle_installing = False
+        self._refresh_paddle_status()
+        QMessageBox.critical(self, "安装失败", msg)
 
     def _on_summary_mode_changed(self, mode: str):
         self.summary_count_container.setVisible(mode == "auto")
 
+    def _on_queue_mode_toggled(self, enabled: bool):
+        if enabled:
+            self.spin_queue_backlog.setValue(300)
+        else:
+            self.spin_ocr_queue.setValue(3)
+        self._on_queue_mode_changed(enabled)
+
     def _on_queue_mode_changed(self, enabled: bool):
-        self.queue_backlog_container.setVisible(enabled)
-        self.legacy_queue_container.setVisible(not enabled)
+        form = self.form_layout
+        form.setRowVisible(self._row_queue_backlog, enabled)
+        form.setRowVisible(self._row_queue_backlog_hint, enabled)
+        form.setRowVisible(self._row_legacy_queue, not enabled)
+        form.setRowVisible(self._row_legacy_queue_hint, not enabled)
 
     def _save(self):
+        backend = self._current_backend()
+        if backend in (BACKEND_CPU, BACKEND_GPU):
+            status = environment_ready(backend_to_device(backend), APP_DIR)
+            if not status.installed:
+                reply = QMessageBox.question(
+                    self,
+                    "环境未通过",
+                    f"当前选择了 {backend}，但环境检测未通过。\n\n"
+                    f"{status.detail}\n\n"
+                    "可先点右侧「安装环境」。仍要保存该设置吗？",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
         self.config["base_url"] = self.txt_base_url.text().strip()
         self.config["api_key"] = self.txt_api_key.text().strip()
         self.config["model"] = self.txt_model.text().strip()
-        self.config["ocr_lang"] = self.cmb_ocr_lang.currentText().strip()
+        self.config["ocr_lang"] = resolve_ocr_lang(backend, self._current_ocr_lang())
         self.config["tesseract_path"] = self.txt_tesseract_path.text().strip()
         self.config["ocr_interval_ms"] = self.spin_ocr_interval.value()
         self.config["det_limit_side_len"] = self.spin_det_limit.value()
@@ -1621,7 +1973,7 @@ class SettingsPage(QWidget):
         self.config["frame_diff_threshold"] = self.spin_frame_diff.value()
         self.config["text_similarity_threshold"] = round(self.spin_text_sim.value(), 2)
         self.config["summary_sentence_count"] = self.spin_summary_count.value()
-        self.config["ocr_backend"] = self.cmb_ocr_backend.currentText()
+        self.config["ocr_backend"] = backend
         self.config["summary_mode"] = self.cmb_summary_mode.currentText()
         self.config["auto_extract_key_info"] = self.chk_auto_key_info.isChecked()
         self.config["theme"] = "dark" if self.cmb_theme.currentIndex() == 0 else "light"
@@ -2348,6 +2700,10 @@ class KeyInfoPage(QWidget):
         page.setContentsMargins(16, 14, 16, 14)
         page.setSpacing(12)
         page.addWidget(make_caption("关键信息 · KEY INFO"))
+        page.addWidget(make_hint(
+            "剧情线索、世界观、角色在同一游戏的各线路间共享。"
+            "不同线路出现设定冲突时，会标成「线路名线中原设定」。剧情总结仍按线路分开。"
+        ))
 
         self.tabs = QTabWidget()
 
@@ -3241,9 +3597,31 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # OCR 测试
     # ------------------------------------------------------------------
+    def _ensure_paddle_plugin(self) -> bool:
+        """选择 paddle 后端时检查旁路插件；未安装则提示并返回 False。"""
+        backend = normalize_backend(self.config.get("ocr_backend", "rapid"))
+        if backend not in (BACKEND_CPU, BACKEND_GPU):
+            return True
+        device = backend_to_device(backend)
+        # 确保后续 OCR 使用主程序目录作为插件根
+        get_manager(APP_DIR)
+        status = environment_ready(device, APP_DIR)
+        if status.installed:
+            return True
+        QMessageBox.warning(
+            self,
+            "环境未通过",
+            f"当前 OCR 后端为 {backend}，环境检测未通过。\n\n"
+            f"{status.detail}\n\n"
+            "请到「设置」页点击「安装环境」，或改回 rapid（内置）。",
+        )
+        return False
+
     def _test_ocr_once(self):
         if not self.region:
             QMessageBox.warning(self, "未选择区域", "请先点击“选择区域”框选游戏文字区域。")
+            return
+        if not self._ensure_paddle_plugin():
             return
         self._set_status("OCR 测试中")
         self.test_thread = TestOCRThread(
@@ -3251,7 +3629,7 @@ class MainWindow(QMainWindow):
             self.config.get("ocr_lang", "chi_sim"),
             self.config.get("tesseract_path", ""),
             self.config.get("ocr_backend", "rapid"),
-            int(self.config.get("det_limit_side_len", 512)),
+            int(self.config.get("det_limit_side_len", 256)),
         )
         self.test_thread.result_ready.connect(self._on_test_ocr_result)
         self.test_thread.error.connect(self._on_test_ocr_error)
@@ -3291,6 +3669,8 @@ class MainWindow(QMainWindow):
             return
         if not self._ensure_game_route():
             return
+        if not self._ensure_paddle_plugin():
+            return
         if self.ocr_worker and self.ocr_worker.isRunning():
             return
 
@@ -3317,7 +3697,7 @@ class MainWindow(QMainWindow):
                 self.config.get("tesseract_path", ""),
                 self.config.get("ocr_backend", "rapid"),
                 backlog_limit=int(self.config.get("queue_backlog_limit", 300)),
-                det_limit=int(self.config.get("det_limit_side_len", 512)),
+                det_limit=int(self.config.get("det_limit_side_len", 256)),
                 start_seq=self._frame_seq_base,
                 frame_diff_threshold=int(
                     self.config.get("frame_diff_threshold", FRAME_DIFF_THRESHOLD)
@@ -3342,7 +3722,7 @@ class MainWindow(QMainWindow):
                 self.config.get("tesseract_path", ""),
                 self.config.get("ocr_backend", "rapid"),
                 queue_size=int(self.config.get("ocr_queue_size", 3)),
-                det_limit=int(self.config.get("det_limit_side_len", 512)),
+                det_limit=int(self.config.get("det_limit_side_len", 256)),
                 frame_diff_threshold=int(
                     self.config.get("frame_diff_threshold", FRAME_DIFF_THRESHOLD)
                 ),
@@ -3636,12 +4016,15 @@ class MainWindow(QMainWindow):
         # 队列模式下总结按钮保持可用：用户读得快时要能继续追加锚点任务
         self._set_summary_status("总结中")
         self.status_window.update_summary_state("总结中")
+        shared_context, route_name = self._shared_knowledge_prompt()
         self.summary_thread = SummaryThread(
             self.llm_client,
             text,
             self.previous_summary,
             auto_extract=self.config.get("auto_extract_key_info", True),
             extra_prompt=self._game_prompt(),
+            shared_context=shared_context,
+            current_route=route_name,
         )
         self.summary_thread.summary_ready.connect(self._on_summary_ready)
         self.summary_thread.error.connect(self._on_summary_error)
@@ -3754,6 +4137,13 @@ class MainWindow(QMainWindow):
             return game.get("prompt") or ""
         return ""
 
+    def _shared_knowledge_prompt(self) -> tuple:
+        """当前游戏已共享的线索、世界观、角色，以及当前线路名。"""
+        if not self.current_route_id:
+            return "", ""
+        route = self.db.get_route(self.current_route_id) or {}
+        return self.db.format_shared_context(self.current_route_id), route.get("name") or ""
+
     def _trigger_summary(self, session_id: Optional[int] = None):
         with self.buffer_lock:
             if not self.text_buffer or self._summarizing:
@@ -3771,12 +4161,15 @@ class MainWindow(QMainWindow):
         self._set_summary_status("总结中")
         self.status_window.update_state(status="识别中")
         self.status_window.update_summary_state("总结中")
+        shared_context, route_name = self._shared_knowledge_prompt()
         self.summary_thread = SummaryThread(
             self.llm_client,
             recent_text,
             self.previous_summary,
             auto_extract=self.config.get("auto_extract_key_info", True),
             extra_prompt=self._game_prompt(),
+            shared_context=shared_context,
+            current_route=route_name,
         )
         self.summary_thread.summary_ready.connect(self._on_summary_ready)
         self.summary_thread.error.connect(self._on_summary_error)
@@ -3791,6 +4184,40 @@ class MainWindow(QMainWindow):
         if not self.text_buffer:
             return
         self._trigger_summary()
+
+    def _apply_extracted_key_info(self, item: dict, summary_id: Optional[int], game_id: Optional[int]):
+        """写入或修订共享关键信息。update_id 只接受本游戏已有条目，避免模型乱改。"""
+        category = item.get("category", "其他")
+        content = (item.get("content") or "").strip()
+        detail = (item.get("detail") or "").strip()
+        update_id = item.get("update_id")
+        if category == "角色信息":
+            if update_id and self.db.character_in_game(int(update_id), game_id):
+                char = self.db.get_character(int(update_id)) or {}
+                name = content or char.get("name") or ""
+                info = self.db._merge_character_info(char.get("info") or "", detail)
+                if name:
+                    self.db.update_character(int(update_id), name, info)
+                return
+            self._persist_character_info(item)
+            return
+        if not content:
+            return
+        if update_id and self.db.key_info_in_game(int(update_id), game_id):
+            old = self.db.get_key_info(int(update_id)) or {}
+            note = old.get("user_note") or ""
+            merged = content
+            if detail and detail not in content:
+                merged = f"{content}；{detail}"
+            self.db.update_key_info(int(update_id), merged, category or old.get("category") or "其他", note)
+            return
+        self.db.add_key_info(
+            self.current_route_id,
+            content=content,
+            category=category,
+            user_note="",
+            summary_id=summary_id,
+        )
 
     def _persist_character_info(self, item: dict):
         """保存角色信息，先与已有角色做 AI 对比去重"""
@@ -3811,7 +4238,7 @@ class MainWindow(QMainWindow):
                 new_name = char["name"]
                 if name not in new_name and new_name != name:
                     new_name = name
-                new_info = f"{char['info']}\n{info}".strip() if info else char["info"]
+                new_info = self.db._merge_character_info(char.get("info") or "", info)
                 self.db.update_character(char["id"], new_name, new_info)
                 return
 
@@ -3825,7 +4252,7 @@ class MainWindow(QMainWindow):
                         new_name = char["name"]
                         if name not in new_name and new_name != name:
                             new_name = name
-                        new_info = f"{char['info']}\n{info}".strip() if info else char["info"]
+                        new_info = self.db._merge_character_info(char.get("info") or "", info)
                         self.db.update_character(matched_id, new_name, new_info)
                         return
 
@@ -3864,19 +4291,10 @@ class MainWindow(QMainWindow):
         except Exception:
             key_info_list = []
         if key_info_list and self.current_route_id:
+            game_id = self.db.game_id_of_route(self.current_route_id)
             for item in key_info_list:
                 try:
-                    category = item.get("category", "其他")
-                    if category == "角色信息":
-                        self._persist_character_info(item)
-                    else:
-                        self.db.add_key_info(
-                            self.current_route_id,
-                            content=item.get("content", ""),
-                            category=category,
-                            user_note="",
-                            summary_id=summary_id,
-                        )
+                    self._apply_extracted_key_info(item, summary_id, game_id)
                 except Exception:
                     pass
 
@@ -4002,6 +4420,7 @@ class MainWindow(QMainWindow):
         if had_worker:
             # 收尾：结束会话、更新时长、恢复按钮状态（旧模式的 worker 也在此停止）
             self._stop_ocr()
+        shutdown_paddle_workers()
         event.accept()
 
 
@@ -4029,6 +4448,7 @@ def main():
         mode = "light"
     apply_theme(app, mode)
     window = MainWindow()
+    _apply_app_icon(app, window)
     window.resize(1000, 720)
     window.setMinimumSize(900, 620)
     window.show()

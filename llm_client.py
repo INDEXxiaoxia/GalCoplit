@@ -26,7 +26,14 @@ class LLMClient:
         data = response.json()
         return data["choices"][0]["message"]["content"].strip()
 
-    def summarize(self, text: str, previous_summary: str = "", extra_prompt: str = "") -> str:
+    def summarize(
+        self,
+        text: str,
+        previous_summary: str = "",
+        extra_prompt: str = "",
+        shared_context: str = "",
+        current_route: str = "",
+    ) -> str:
         system = (
             "你正在陪用户玩Galgame。请根据OCR识别出的游戏文本，结合之前的剧情总结，"
             "用中文总结当前剧情。总结要内容充实、篇幅适当加长，尽量完整保留以下有效信息："
@@ -34,11 +41,23 @@ class LLMClient:
             "伏笔、线索以及对后续剧情可能有影响的细节；涉及的世界观、地点、组织等设定；"
             "以及明显的情感变化。宁可保留更多细节，也不要过度精简丢失线索。"
             "不要添加任何前缀或标题（如“剧情总结：”），直接输出总结内容。"
+            "剧情总结只写当前线路已经发生的事，不要把其他线路的剧情写进来。"
         )
+        if shared_context:
+            system += (
+                "\n\n同一游戏的剧情线索、世界观设定和角色信息在各线路之间共享。"
+                "若当前文本与已有共享设定冲突，在总结中点明差异。"
+                "冲突标注必须写成「线路名线中原设定」；若线路名本身以「线」结尾，则写成「线路名中原设定」。"
+                "没有冲突时不要添加这类标注。"
+            )
+            if current_route:
+                system += f"\n当前线路：{current_route}"
         if extra_prompt:
             system += "\n\n" + extra_prompt
 
         user = ""
+        if shared_context:
+            user += f"已有共享信息（全游戏，不是本线路剧情）：\n{shared_context}\n\n"
         if previous_summary:
             user += f"之前的剧情总结：\n{previous_summary}\n\n"
         user += f"最近识别到的游戏文本：\n{text}\n\n请生成一段内容充实、细节完整的中文剧情总结："
@@ -70,8 +89,15 @@ class LLMClient:
         title = title.strip().splitlines()[0].strip().strip("\"'“”‘’《》【】")
         return title[:16]
 
-    def extract_key_info(self, summary_text: str, raw_text: str = "", extra_prompt: str = "") -> list:
-        """从总结和原始文本中提取关键信息。返回列表 [{content, category, detail}]"""
+    def extract_key_info(
+        self,
+        summary_text: str,
+        raw_text: str = "",
+        extra_prompt: str = "",
+        shared_context: str = "",
+        current_route: str = "",
+    ) -> list:
+        """从总结和原始文本中提取关键信息。返回列表 [{content, category, detail, update_id}]"""
         system = (
             "你是Galgame剧情分析助手。请严格从剧情总结和原始文本中，提取真正关键的信息。"
             "关键信息仅分为三类：剧情线索、世界观设定、角色信息。"
@@ -81,12 +107,26 @@ class LLMClient:
             "如果该角色有别名或另一个常用称呼，请在角色名后用括号补充，格式为：原名（别名），"
             "例如：由佳（ユカ）。不要包含任何描述、身份或说明；描述必须放在 detail 字段中。"
             "先对每条候选信息进行严格评估：如果它只是普通对话、场景描写、情绪渲染、无关紧要的细节，或对理解后续剧情没有实质帮助，就不要放入结果。"
+            "同一游戏的剧情线索、世界观设定、角色信息在所有线路之间共享。必须对照「已有共享信息」，不要重复输出实质相同的条目。"
+            "若本段只是给已有条目补充不冲突的新事实，设置 update_id 为该条目的 id，并在 content 或 detail 中写出补充后的完整文本。"
+            "若本段与已有设定冲突，不要静默覆盖，也不要另建一条互相矛盾的新条目。"
+            "设置 update_id 为被冲突条目的 id，保留本段的新事实，并在冲突处紧接标注原设定。"
+            "标注格式严格为：线路名线中原设定。线路名使用已有信息里的来源线路，不要自造。"
+            "若线路名本身以「线」结尾，写成「线路名中原设定」，不要写成「线线中」。"
+            "示例：已有「真结局」记载由佳是学生，本段表明她是教师，则 detail 写：教师；真结局线中学生。"
+            "没有冲突时不要添加这类标注。全新信息不要填 update_id。"
             "只返回JSON数组，每个元素包含 content（内容）、category（分类：剧情线索/世界观设定/角色信息）、"
-            "detail（角色信息时必填，其他可为空）。如果没有明显关键信息，返回空数组 []。"
+            "detail（角色信息时必填，其他可为空）、update_id（更新已有条目时填其 id，否则省略或为 null）。"
+            "如果没有明显的新信息或需要修订的冲突，返回空数组 []。"
         )
+        if current_route:
+            system += f"\n当前正在记录的线路：{current_route}"
         if extra_prompt:
             system += "\n\n" + extra_prompt
-        user = f"剧情总结：\n{summary_text}\n\n原始文本：\n{raw_text}\n\n请提取关键信息："
+        user = ""
+        if shared_context:
+            user += f"已有共享信息：\n{shared_context}\n\n"
+        user += f"剧情总结：\n{summary_text}\n\n原始文本：\n{raw_text}\n\n请提取关键信息："
         try:
             text = self._chat(
                 [
@@ -164,10 +204,19 @@ class LLMClient:
             result = []
             for item in data:
                 if isinstance(item, dict) and "content" in item:
+                    update_id = item.get("update_id")
+                    try:
+                        if update_id in (None, "", "null"):
+                            update_id = None
+                        else:
+                            update_id = int(update_id)
+                    except (TypeError, ValueError):
+                        update_id = None
                     result.append({
                         "content": str(item.get("content", "")),
                         "category": str(item.get("category", "其他")),
                         "detail": str(item.get("detail", "")),
+                        "update_id": update_id,
                     })
             return result
         return []

@@ -5,8 +5,26 @@ import re
 from typing import Optional, List, Dict, Any
 
 
+def conflict_mark(route_name: str, fact: str) -> str:
+    """设定冲突标注：线路名线中原设定。线路名已以「线」结尾时不再重复加「线」。"""
+    name = (route_name or "").strip() or "其他"
+    fact = re.sub(r"\s+", " ", (fact or "").strip())
+    if not fact:
+        return ""
+    if name.endswith("线"):
+        return f"{name}中{fact}"
+    return f"{name}线中{fact}"
+
+
+def _base_name(name: str) -> str:
+    return re.split(r"[（(]", name or "")[0].strip()
+
+
 class Database:
-    """管理游戏、线路、会话、剧情总结与关键信息的持久化"""
+    """管理游戏、线路、会话、剧情总结与关键信息的持久化。
+
+    剧情总结仍按线路保存。剧情线索、世界观设定、角色信息按游戏共享。
+    """
 
     def __init__(self, db_path: str = "records.db"):
         self.db_path = db_path
@@ -114,6 +132,7 @@ class Database:
                 )
                 """
             )
+            self._migrate_shared_knowledge(conn)
             conn.commit()
 
     def _migrate_legacy(self, conn: sqlite3.Connection):
@@ -137,6 +156,91 @@ class Database:
                 except sqlite3.OperationalError:
                     pass
         conn.commit()
+
+    def _table_columns(self, conn: sqlite3.Connection, table: str) -> set:
+        try:
+            return {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        except sqlite3.OperationalError:
+            return set()
+
+    def _migrate_shared_knowledge(self, conn: sqlite3.Connection):
+        """旧库：关键信息/角色仍挂在线路上。补 game_id 后按游戏共享，不丢原有内容。"""
+        for table in ("key_info", "characters"):
+            if "id" not in self._table_columns(conn, table):
+                continue
+            if "game_id" not in self._table_columns(conn, table):
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN game_id INTEGER")
+        if "sort_order" not in self._table_columns(conn, "characters"):
+            conn.execute("ALTER TABLE characters ADD COLUMN sort_order INTEGER DEFAULT 0")
+        conn.execute(
+            """
+            UPDATE key_info
+            SET game_id = (SELECT game_id FROM routes WHERE routes.id = key_info.route_id)
+            WHERE game_id IS NULL
+            """
+        )
+        conn.execute(
+            """
+            UPDATE characters
+            SET game_id = (SELECT game_id FROM routes WHERE routes.id = characters.route_id)
+            WHERE game_id IS NULL
+            """
+        )
+        self._dedupe_shared_key_info(conn)
+        self._merge_shared_characters(conn)
+
+    def _dedupe_shared_key_info(self, conn: sqlite3.Connection):
+        """同一游戏里完全相同的线索/设定只留最早一条。"""
+        rows = conn.execute(
+            """
+            SELECT id, game_id, category, content
+            FROM key_info
+            WHERE game_id IS NOT NULL
+            ORDER BY id ASC
+            """
+        ).fetchall()
+        seen = set()
+        for item_id, game_id, category, content in rows:
+            key = (game_id, category or "", (content or "").strip())
+            if key in seen:
+                conn.execute("DELETE FROM key_info WHERE id=?", (item_id,))
+            else:
+                seen.add(key)
+
+    def _merge_shared_characters(self, conn: sqlite3.Connection):
+        """同一游戏、同一基础名的角色合并为一条；不同描述按来源线路打冲突标注。"""
+        rows = conn.execute(
+            """
+            SELECT c.id, c.game_id, c.name, c.info, COALESCE(r.name, '')
+            FROM characters c
+            LEFT JOIN routes r ON r.id = c.route_id
+            WHERE c.game_id IS NOT NULL
+            ORDER BY c.id ASC
+            """
+        ).fetchall()
+        groups: Dict[tuple, list] = {}
+        for row in rows:
+            groups.setdefault((row[1], _base_name(row[2])), []).append(row)
+        for items in groups.values():
+            if len(items) < 2 or not items[0][0]:
+                continue
+            keep_id, _game_id, keep_name, keep_info, _keep_route = items[0]
+            merged_name = keep_name or ""
+            merged_info = keep_info or ""
+            for _cid, _gid, name, info, route_name in items[1:]:
+                other_name = name or ""
+                if len(other_name) > len(merged_name) and _base_name(other_name) == _base_name(merged_name):
+                    merged_name = other_name
+                other_info = (info or "").strip()
+                if other_info and other_info not in merged_info:
+                    mark = conflict_mark(route_name, other_info)
+                    merged_info = f"{merged_info}\n{mark}".strip() if merged_info else mark
+                conn.execute("DELETE FROM characters WHERE id=?", (_cid,))
+            if merged_name != (keep_name or "") or merged_info != (keep_info or ""):
+                conn.execute(
+                    "UPDATE characters SET name=?, info=? WHERE id=?",
+                    (merged_name, merged_info, keep_id),
+                )
 
     # ------------------------------------------------------------------
     # 游戏
@@ -177,8 +281,20 @@ class Database:
 
     def delete_game(self, game_id: int):
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute("DELETE FROM characters WHERE route_id IN (SELECT id FROM routes WHERE game_id=?)", (game_id,))
-            conn.execute("DELETE FROM key_info WHERE route_id IN (SELECT id FROM routes WHERE game_id=?)", (game_id,))
+            conn.execute(
+                """
+                DELETE FROM characters
+                WHERE game_id=? OR route_id IN (SELECT id FROM routes WHERE game_id=?)
+                """,
+                (game_id, game_id),
+            )
+            conn.execute(
+                """
+                DELETE FROM key_info
+                WHERE game_id=? OR route_id IN (SELECT id FROM routes WHERE game_id=?)
+                """,
+                (game_id, game_id),
+            )
             conn.execute("DELETE FROM summaries WHERE route_id IN (SELECT id FROM routes WHERE game_id=?)", (game_id,))
             conn.execute("DELETE FROM sessions WHERE route_id IN (SELECT id FROM routes WHERE game_id=?)", (game_id,))
             conn.execute("DELETE FROM routes WHERE game_id=?", (game_id,))
@@ -219,9 +335,8 @@ class Database:
             conn.commit()
 
     def delete_route(self, route_id: int):
+        """删除线路及其剧情总结。线索、世界观、角色属于游戏，不随单条线路删除。"""
         with sqlite3.connect(self.db_path) as conn:
-            conn.execute("DELETE FROM characters WHERE route_id=?", (route_id,))
-            conn.execute("DELETE FROM key_info WHERE route_id=?", (route_id,))
             conn.execute("DELETE FROM summaries WHERE route_id=?", (route_id,))
             conn.execute("DELETE FROM sessions WHERE route_id=?", (route_id,))
             conn.execute("DELETE FROM routes WHERE id=?", (route_id,))
@@ -353,6 +468,13 @@ class Database:
     # ------------------------------------------------------------------
     # 关键信息
     # ------------------------------------------------------------------
+    def game_id_of_route(self, route_id: int) -> Optional[int]:
+        route = self.get_route(route_id)
+        if not route:
+            return None
+        game_id = route.get("game_id")
+        return int(game_id) if game_id else None
+
     def add_key_info(
         self,
         route_id: int,
@@ -361,32 +483,72 @@ class Database:
         user_note: str = "",
         summary_id: Optional[int] = None,
     ) -> int:
+        content = (content or "").strip()
         now = datetime.datetime.now().isoformat()
+        game_id = self.game_id_of_route(route_id)
         with sqlite3.connect(self.db_path) as conn:
+            if game_id and content:
+                existing = conn.execute(
+                    """
+                    SELECT id FROM key_info
+                    WHERE game_id=? AND category=? AND content=?
+                    ORDER BY id ASC LIMIT 1
+                    """,
+                    (game_id, category, content),
+                ).fetchone()
+                if existing:
+                    return int(existing[0])
             cur = conn.execute(
                 """
-                INSERT INTO key_info (route_id, summary_id, content, category, user_note, created_at)
-                VALUES (?, ?, ?, ?, ?, ?)
+                INSERT INTO key_info (route_id, summary_id, content, category, user_note, created_at, game_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
                 """,
-                (route_id, summary_id, content, category, user_note, now),
+                (route_id, summary_id, content, category, user_note, now, game_id),
             )
             conn.commit()
             return cur.lastrowid
 
     def list_key_info(self, route_id: int, category: Optional[str] = None) -> List[Dict[str, Any]]:
+        """返回该线路所属游戏的共享关键信息。找不到游戏时退回只查本线路。"""
+        game_id = self.game_id_of_route(route_id)
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            if category:
-                rows = conn.execute(
-                    "SELECT * FROM key_info WHERE route_id=? AND category=? ORDER BY created_at ASC",
-                    (route_id, category),
-                ).fetchall()
+            if game_id:
+                sql = (
+                    "SELECT k.*, COALESCE(r.name, '') AS source_route "
+                    "FROM key_info k LEFT JOIN routes r ON r.id = k.route_id "
+                    "WHERE k.game_id=?"
+                )
+                params: list = [game_id]
             else:
-                rows = conn.execute(
-                    "SELECT * FROM key_info WHERE route_id=? ORDER BY created_at ASC",
-                    (route_id,),
-                ).fetchall()
+                sql = (
+                    "SELECT k.*, COALESCE(r.name, '') AS source_route "
+                    "FROM key_info k LEFT JOIN routes r ON r.id = k.route_id "
+                    "WHERE k.route_id=?"
+                )
+                params = [route_id]
+            if category:
+                sql += " AND k.category=?"
+                params.append(category)
+            sql += " ORDER BY k.created_at ASC"
+            rows = conn.execute(sql, params).fetchall()
             return [dict(row) for row in rows]
+
+    def get_key_info(self, key_info_id: int) -> Optional[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM key_info WHERE id=?", (key_info_id,)).fetchone()
+            return dict(row) if row else None
+
+    def key_info_in_game(self, key_info_id: int, game_id: Optional[int]) -> bool:
+        if not game_id:
+            return False
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM key_info WHERE id=? AND game_id=?",
+                (key_info_id, game_id),
+            ).fetchone()
+            return row is not None
 
     def update_key_info(self, key_info_id: int, content: str, category: str, user_note: str):
         with sqlite3.connect(self.db_path) as conn:
@@ -405,22 +567,26 @@ class Database:
     # 角色信息
     # ------------------------------------------------------------------
     def add_or_update_character(self, route_id: int, name: str, info: str = "") -> int:
-        def _base_name(n: str) -> str:
-            return re.split(r"[（(]", n)[0].strip()
-
         now = datetime.datetime.now().isoformat()
         new_base = _base_name(name)
+        game_id = self.game_id_of_route(route_id)
         with sqlite3.connect(self.db_path) as conn:
-            rows = conn.execute(
-                "SELECT id, name, info FROM characters WHERE route_id=?",
-                (route_id,),
-            ).fetchall()
+            if game_id:
+                rows = conn.execute(
+                    "SELECT id, name, info FROM characters WHERE game_id=?",
+                    (game_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, name, info FROM characters WHERE route_id=?",
+                    (route_id,),
+                ).fetchall()
             for char_id, existing_name, existing_info in rows:
                 if _base_name(existing_name) == new_base:
                     updated_name = existing_name
                     if existing_name != name and name not in existing_name:
                         updated_name = name
-                    new_info = f"{existing_info}\n{info}".strip() if info else existing_info
+                    new_info = self._merge_character_info(existing_info or "", info or "")
                     conn.execute(
                         "UPDATE characters SET name=?, info=?, updated_at=? WHERE id=?",
                         (updated_name, new_info, now, char_id),
@@ -428,20 +594,96 @@ class Database:
                     conn.commit()
                     return char_id
             cur = conn.execute(
-                "INSERT INTO characters (route_id, name, info, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (route_id, name, info, now, now),
+                """
+                INSERT INTO characters (route_id, name, info, created_at, updated_at, game_id)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (route_id, name, info, now, now, game_id),
             )
             conn.commit()
             return cur.lastrowid
 
+    @staticmethod
+    def _merge_character_info(existing_info: str, new_info: str) -> str:
+        existing_info = (existing_info or "").strip()
+        new_info = (new_info or "").strip()
+        if not new_info or new_info in existing_info:
+            return existing_info
+        # 新文本已包含旧描述（通常带了冲突标注）时，用新文本替换，避免越拼越长
+        if existing_info and existing_info in new_info:
+            return new_info
+        if not existing_info:
+            return new_info
+        return f"{existing_info}\n{new_info}".strip()
+
     def list_characters(self, route_id: int) -> List[Dict[str, Any]]:
+        """返回该线路所属游戏的共享角色。找不到游戏时退回只查本线路。"""
+        game_id = self.game_id_of_route(route_id)
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
-            rows = conn.execute(
-                "SELECT * FROM characters WHERE route_id=? ORDER BY sort_order ASC, updated_at DESC",
-                (route_id,),
-            ).fetchall()
+            if game_id:
+                rows = conn.execute(
+                    """
+                    SELECT c.*, COALESCE(r.name, '') AS source_route
+                    FROM characters c
+                    LEFT JOIN routes r ON r.id = c.route_id
+                    WHERE c.game_id=?
+                    ORDER BY c.sort_order ASC, c.updated_at DESC
+                    """,
+                    (game_id,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT c.*, COALESCE(r.name, '') AS source_route
+                    FROM characters c
+                    LEFT JOIN routes r ON r.id = c.route_id
+                    WHERE c.route_id=?
+                    ORDER BY c.sort_order ASC, c.updated_at DESC
+                    """,
+                    (route_id,),
+                ).fetchall()
             return [dict(row) for row in rows]
+
+    def get_character(self, char_id: int) -> Optional[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT * FROM characters WHERE id=?", (char_id,)).fetchone()
+            return dict(row) if row else None
+
+    def character_in_game(self, char_id: int, game_id: Optional[int]) -> bool:
+        if not game_id:
+            return False
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT 1 FROM characters WHERE id=? AND game_id=?",
+                (char_id, game_id),
+            ).fetchone()
+            return row is not None
+
+    def format_shared_context(self, route_id: int, limit: int = 7000) -> str:
+        """给总结/关键信息提示词用的共享设定。剧情总结本身不包含在内。"""
+        parts = []
+        for item in self.list_key_info(route_id):
+            source = (item.get("source_route") or "").strip() or "未知线路"
+            note = (item.get("user_note") or "").strip()
+            line = f"- id={item['id']} [{item.get('category') or '其他'}] {item.get('content') or ''}"
+            if note:
+                line += f"（备注：{note}）"
+            line += f"（来源：{source}）"
+            parts.append(line)
+        for char in self.list_characters(route_id):
+            source = (char.get("source_route") or "").strip() or "未知线路"
+            info = re.sub(r"\s+", " ", (char.get("info") or "").strip())
+            line = f"- id={char['id']} [角色信息] {char.get('name') or ''}"
+            if info:
+                line += f"：{info}"
+            line += f"（来源：{source}）"
+            parts.append(line)
+        text = "\n".join(parts).strip()
+        if len(text) > limit:
+            text = text[:limit].rstrip() + "\n…（其余共享信息已省略）"
+        return text
 
     def update_character(self, char_id: int, name: str, info: str):
         now = datetime.datetime.now().isoformat()

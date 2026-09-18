@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 import io
 import os
 import numpy as np
@@ -20,50 +21,71 @@ try:
 except ImportError:
     _WINRT = False
 
-# PaddleOCR（可选）
-_PADDLE = False
-_PADDLE_IMPORT_ERROR = ""
-try:
-    # 兼容 paddle 与新版 protobuf 的冲突
-    os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"
-    # 关闭 oneDNN/MKLDNN，避免某些 CPU 上报 Unimplemented 错误
-    os.environ["FLAGS_use_mkldnn"] = "0"
-    from paddleocr import PaddleOCR
-    _PADDLE = True
-except Exception as e:
-    _PADDLE_IMPORT_ERROR = str(e)
-    _PADDLE = False
-
-# RapidOCR（可选）
+# RapidOCR（主程序内置）
 try:
     from rapidocr_onnxruntime import RapidOCR
     _RAPID = True
 except ImportError:
     _RAPID = False
 
+# Paddle 仅通过旁路插件调用，主进程不再 import paddleocr
+from paddle_plugin import (
+    BACKEND_CPU,
+    BACKEND_GPU,
+    backend_to_device,
+    describe_backends,
+    get_manager,
+)
 
-SUPPORTED_BACKENDS = ["tesseract", "windows", "paddle", "rapid"]
+SUPPORTED_BACKENDS = ["tesseract", "windows", "rapid", BACKEND_CPU, BACKEND_GPU]
 
-# PaddleOCR 初始化较慢，按语言缓存实例
-_paddle_ocr_cache = {}
+DEFAULT_OCR_LANG = "chi_sim"
 
+# 各后端可用的语言码（写入 config 的值）。Rapid 为固定中文 ONNX；
+# Paddle 使用 PP-OCRv6_small 统一多语模型（无韩语专用包，故不含 kor）。
+OCR_LANG_OPTIONS = {
+    "rapid": ["chi_sim"],
+    "tesseract": [
+        "chi_sim",
+        "chi_tra",
+        "eng",
+        "jpn",
+        "kor",
+        "deu",
+        "fra",
+        "spa",
+    ],
+    "windows": ["chi_sim", "eng", "jpn"],
+    BACKEND_CPU: [
+        "chi_sim",
+        "chi_tra",
+        "eng",
+        "jpn",
+        "deu",
+        "fra",
+        "spa",
+    ],
+    BACKEND_GPU: [
+        "chi_sim",
+        "chi_tra",
+        "eng",
+        "jpn",
+        "deu",
+        "fra",
+        "spa",
+    ],
+}
 
-def _to_paddle_lang(lang: str) -> str:
-    """把 Tesseract 风格语言代码映射为 PaddleOCR 的语言代码"""
-    lang_lower = lang.lower().split("_")[0]
-    mapping = {
-        "chi": "ch",
-        "zh": "ch",
-        "jpn": "japan",
-        "ja": "japan",
-        "eng": "en",
-        "en": "en",
-        "fr": "french",
-        "de": "german",
-        "ko": "korean",
-        "korean": "korean",
-    }
-    return mapping.get(lang_lower, "ch")
+OCR_LANG_LABELS = {
+    "chi_sim": "中文简体",
+    "chi_tra": "中文繁体",
+    "eng": "英语",
+    "jpn": "日语",
+    "kor": "韩语",
+    "deu": "德语",
+    "fra": "法语",
+    "spa": "西班牙语",
+}
 
 
 def set_tesseract_cmd(path: str):
@@ -119,33 +141,14 @@ def _windows_ocr(pil_image: Image.Image) -> str:
     return asyncio.run(_windows_ocr_async(pil_image))
 
 
-def _get_paddle_ocr(lang: str) -> "PaddleOCR":
-    """获取/缓存对应语言的 PaddleOCR 实例"""
-    if not _PADDLE:
-        raise RuntimeError("未安装 paddleocr")
-    paddle_lang = _to_paddle_lang(lang)
-    if paddle_lang not in _paddle_ocr_cache:
-        _paddle_ocr_cache[paddle_lang] = PaddleOCR(lang=paddle_lang)
-    return _paddle_ocr_cache[paddle_lang]
-
-
-def _paddle_ocr(pil_image: Image.Image, lang: str) -> str:
-    """使用 PaddleOCR 识别"""
-    ocr = _get_paddle_ocr(lang)
-    # 第一次使用时会自动下载模型，可能需要联网
-    result = ocr.ocr(np.array(pil_image))
-    if not result:
-        return ""
-    # 兼容不同版本返回结构
-    lines = result[0] if isinstance(result, list) and result else []
-    if not lines:
-        return ""
-    texts = []
-    for line in lines:
-        if line and len(line) >= 2:
-            # line 结构：[box, (text, confidence)]
-            texts.append(line[1][0])
-    return "\n".join(texts).strip()
+def _paddle_ocr(
+    pil_image: Image.Image, lang: str, backend: str, det_limit: int = 0
+) -> str:
+    """通过旁路 worker 调用 PaddleOCR（cpu/gpu 插件二选一）"""
+    device = backend_to_device(backend)
+    return get_manager().ocr_image(
+        pil_image, lang=lang, device=device, det_limit=det_limit
+    )
 
 
 # RapidOCR 实例缓存（按检测分辨率分键，改配置可重建）
@@ -189,12 +192,47 @@ def _rapid_ocr(pil_image: Image.Image, det_limit: int = 0) -> str:
     return text
 
 
-def ocr_image_extended(pil_image: Image.Image, lang: str = "chi_sim", backend: str = "tesseract", det_limit: int = 0) -> tuple:
+def normalize_backend(backend: str) -> str:
+    """兼容旧配置 paddle → paddle-cpu。"""
+    if backend == "paddle":
+        return BACKEND_CPU
+    return backend
+
+
+def langs_for_backend(backend: str) -> list:
+    """返回指定 OCR 后端可用的语言码列表，默认中文简体优先。"""
+    backend = normalize_backend(backend or "rapid")
+    langs = list(OCR_LANG_OPTIONS.get(backend, OCR_LANG_OPTIONS["rapid"]))
+    if DEFAULT_OCR_LANG in langs:
+        langs = [DEFAULT_OCR_LANG] + [x for x in langs if x != DEFAULT_OCR_LANG]
+    return langs
+
+
+def resolve_ocr_lang(backend: str, lang: str) -> str:
+    """若当前语言不属于该后端，回退到默认中文。"""
+    langs = langs_for_backend(backend)
+    text = (lang or "").strip()
+    if text in langs:
+        return text
+    return langs[0] if langs else DEFAULT_OCR_LANG
+
+
+def paddle_plugin_status(app_dir=None) -> dict:
+    return describe_backends(app_dir)
+
+
+def ocr_image_extended(
+    pil_image: Image.Image,
+    lang: str = "chi_sim",
+    backend: str = "tesseract",
+    det_limit: int = 0,
+) -> tuple:
     """按指定后端执行 OCR，返回 (text, confidence)。
 
     confidence 仅在 rapid 后端有值（平均置信度 0..1），其余后端为 -1（无置信度）。
     错误语义与 ocr_image 一致：后端未安装抛 RuntimeError，识别失败返回带前缀的文本。
     """
+    backend = normalize_backend(backend)
     if backend == "tesseract":
         if not _PYTESSERACT:
             raise RuntimeError("未安装 pytesseract，无法使用 Tesseract OCR")
@@ -209,13 +247,14 @@ def ocr_image_extended(pil_image: Image.Image, lang: str = "chi_sim", backend: s
             return _windows_ocr(pil_image), -1.0
         except Exception as e:
             return f"[OCR错误: {e}]", -1.0
-    elif backend == "paddle":
-        if not _PADDLE:
-            msg = _PADDLE_IMPORT_ERROR or "未安装 paddleocr"
-            raise RuntimeError(f"无法使用 PaddleOCR: {msg}")
+    elif backend in (BACKEND_CPU, BACKEND_GPU):
         try:
-            return _paddle_ocr(pil_image, lang), -1.0
+            return _paddle_ocr(pil_image, lang, backend, det_limit=det_limit), -1.0
         except Exception as e:
+            # 插件缺失等配置问题向上抛，便于设置页/测试弹窗展示
+            msg = str(e)
+            if "未安装" in msg or "插件" in msg:
+                raise RuntimeError(msg) from e
             return f"[OCR错误: {e}]", -1.0
     elif backend == "rapid":
         if not _RAPID:
@@ -227,7 +266,14 @@ def ocr_image_extended(pil_image: Image.Image, lang: str = "chi_sim", backend: s
     return f"[OCR错误: 不支持的 backend '{backend}']", -1.0
 
 
-def ocr_image(pil_image: Image.Image, lang: str = "chi_sim", backend: str = "tesseract", det_limit: int = 0) -> str:
+def ocr_image(
+    pil_image: Image.Image,
+    lang: str = "chi_sim",
+    backend: str = "tesseract",
+    det_limit: int = 0,
+) -> str:
     """按指定后端执行 OCR（仅返回文本）"""
-    text, _ = ocr_image_extended(pil_image, lang=lang, backend=backend, det_limit=det_limit)
+    text, _ = ocr_image_extended(
+        pil_image, lang=lang, backend=backend, det_limit=det_limit
+    )
     return text

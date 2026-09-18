@@ -4,9 +4,9 @@
 
 ## 主要功能
 
-- **游戏 / 线路档案**：每个游戏可创建多条线路，数据按线路隔离，支持继续上次游玩。
+- **游戏 / 线路档案**：每个游戏可创建多条线路。剧情总结按线路分开；线索、世界观、角色在同一游戏的各线路间共享。
 - **框选区域持续 OCR**：在游戏画面上框出文字区域，持续截图识别。
-- **OCR 后端可切换**：RapidOCR、Tesseract、Windows OCR、PaddleOCR。
+- **OCR 后端可切换**：RapidOCR（内置）、PaddleOCR CPU/GPU（旁路插件）、Tesseract、Windows OCR。
 - **剧情总结**：自动按句数触发，或手动模式随时总结；时间线查看与编辑。
 - **关键信息**：自动提取伏笔、线索、人物、设定；角色卡片可拖动排序。
 - **游玩时长留档**：自动记录每次游玩时间。
@@ -43,7 +43,7 @@ python main.py
 | `api_key` | OpenAI 兼容 API 密钥 |
 | `base_url` | 接口地址，需以 `/v1` 结尾 |
 | `model` | 模型名 |
-| `ocr_backend` | `rapid`（推荐）/ `tesseract` / `windows` / `paddle` |
+| `ocr_backend` | `rapid`（内置推荐）/ `paddle-cpu` / `paddle-gpu` / `tesseract` / `windows` |
 | `ocr_lang` | 如 `chi_sim`、`jpn`、`eng` |
 | `summary_mode` | `auto` 或 `manual` |
 | `summary_sentence_count` | 自动模式下累计多少句触发总结 |
@@ -58,10 +58,20 @@ python main.py
 ## 打包
 
 ```bash
-build.bat
+build.bat              # 单文件版 dist/GalCoplit.exe（约 <150 MB，启动稍慢）
+build_install.bat      # 安装版：目录内核 + dist/GalCoplit-Setup.exe（启动更快）
 ```
 
-产物：`dist/GalCoplit.exe`（约 130 MB）。请在干净的 `build_venv` 中构建；`requirements.txt` 已固定 `numpy<2` 与 `onnxruntime==1.18.1` 以保证 exe 内 RapidOCR 可用。
+安装版需本机安装 [Inno Setup 6](https://jrsoftware.org/isinfo.php)。覆盖安装时**不会**改动已有 `config.json`、`records.db`、`paddle_ocr_cpu/`、`paddle_ocr_gpu/`。
+
+### 可选：PaddleOCR 旁路插件（不打进主包）
+
+```bash
+python setup_paddle_plugin.py cpu    # 生成 paddle_ocr_cpu/
+python setup_paddle_plugin.py gpu    # 生成 paddle_ocr_gpu/（需本机 CUDA）
+```
+
+将对应目录放在主程序旁边，设置里选择 `paddle-cpu` / `paddle-gpu`。日常直接在设置页点「安装环境」即可；若要把插件打成独立 exe，可在插件 venv 里执行 `python build.py --paddle-worker`。
 
 ## 项目结构
 
@@ -69,14 +79,20 @@ build.bat
 GalCoplit/
 ├── main.py              # 主程序与界面
 ├── ocr_engine.py        # OCR 封装
+├── paddle_plugin.py     # Paddle 旁路插件发现与 IPC
+├── paddle_ocr_worker.py # Paddle OCR HTTP worker
+├── setup_paddle_plugin.py
+├── PaddleOcrWorker.spec # 可选：旁路 worker 打包规格
 ├── llm_client.py        # LLM 调用
 ├── recorder.py          # SQLite 记录
 ├── theme.py             # 主题与样式
 ├── framecmp.py          # 帧对比辅助
 ├── config.example.json  # 配置示例
 ├── requirements.txt
-├── GalCoplit.spec       # PyInstaller 规格
-├── build.bat / start.bat
+├── GalCoplit.spec       # 单文件打包
+├── GalCoplit-install.spec
+├── GalCoplit.iss        # Inno 安装脚本
+├── build.bat / build_install.bat / start.bat
 ├── icon.ico
 └── LICENSE              # GPL-3.0
 ```

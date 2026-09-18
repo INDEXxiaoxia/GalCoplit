@@ -3,7 +3,10 @@
 # 关键：只在干净的 build_venv 里构建（numpy<2.0 + onnxruntime==1.18.1），
 # 并用 excludes 排除不会用到的可选 OCR 后端与未使用的 PyQt6 扩展绑定，
 # 同时剔除 opencv 的视频读写 ffmpeg DLL（OCR 只用图像处理，不需要它）。
+import os
 from PyInstaller.utils.hooks import collect_all
+
+SPECDIR = os.path.dirname(os.path.abspath(SPEC))
 
 datas = []
 binaries = []
@@ -24,6 +27,11 @@ for entry in b:
     if 'opencv_videoio_ffmpeg' in entry[0].lower():
         continue
     binaries.append(entry)
+
+# 运行时窗口/任务栏图标（exe 资源图标另见 EXE icon=）
+icon_src = os.path.join(SPECDIR, 'icon.ico')
+if os.path.isfile(icon_src):
+    datas += [(icon_src, '.')]
 
 excludes = [
     # 不会打包进 exe 的可选 OCR 后端 / 重型库（防止脏环境被卷入）
@@ -79,5 +87,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['icon.ico'],
+    icon=icon_src if os.path.isfile(icon_src) else None,
 )
