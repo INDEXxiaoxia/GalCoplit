@@ -35,7 +35,7 @@ from ocr_engine import (
     OCR_LANG_LABELS,
     DEFAULT_OCR_LANG,
 )
-from llm_client import LLMClient
+from llm_client import LLMClient, SUMMARY_PROMPT_BRIEF, SUMMARY_USER_TAIL
 from recorder import Database
 import theme
 from theme import apply_theme, status_visual, make_shadow
@@ -82,6 +82,7 @@ def _default_config() -> dict:
         "frame_diff_threshold": FRAME_DIFF_THRESHOLD,
         "text_similarity_threshold": TEXT_SIM_THRESHOLD,
         "auto_extract_key_info": True,
+        "save_ocr_text": False,
         "summary_mode": "auto",
         "theme": "light",
     }
@@ -130,6 +131,9 @@ def _normalize_config(config: dict) -> dict:
     if isinstance(config.get("queue_mode"), str):
         config["queue_mode"] = config["queue_mode"].lower() == "true"
     config["queue_mode"] = bool(config.get("queue_mode", True))
+    if isinstance(config.get("save_ocr_text"), str):
+        config["save_ocr_text"] = config["save_ocr_text"].lower() == "true"
+    config["save_ocr_text"] = bool(config.get("save_ocr_text", False))
     if not isinstance(config.get("queue_backlog_limit"), int) or config["queue_backlog_limit"] < 20:
         config["queue_backlog_limit"] = defaults["queue_backlog_limit"]
     # 检测分辨率：合法范围 64..800
@@ -212,6 +216,23 @@ def _apply_app_icon(app: QApplication, window: Optional[QMainWindow] = None) -> 
 def _sanitize_filename(name: str) -> str:
     """去掉 Windows 文件名非法字符"""
     return re.sub(r'[\\\\<>:\"/|?*]', '', name).strip()
+
+
+_WIN_RESERVED_NAMES = {
+    "CON", "PRN", "AUX", "NUL",
+    *(f"COM{i}" for i in range(1, 10)),
+    *(f"LPT{i}" for i in range(1, 10)),
+}
+
+
+def _safe_path_part(name: str) -> str:
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", (name or "").strip())
+    cleaned = cleaned.rstrip(". ")
+    if not cleaned:
+        cleaned = "未命名"
+    if cleaned.upper() in _WIN_RESERVED_NAMES:
+        cleaned = f"_{cleaned}"
+    return cleaned[:80]
 
 
 def _format_dt(iso: str) -> str:
@@ -946,6 +967,8 @@ class SummaryTask:
     session_id: Optional[int] = None
     state: str = "等待识别"
     created_at: datetime.datetime = field(default_factory=datetime.datetime.now)
+    raw_text: str = ""
+    error: str = ""
 
 
 class SummaryThread(QThread):
@@ -962,6 +985,7 @@ class SummaryThread(QThread):
         extra_prompt: str = "",
         shared_context: str = "",
         current_route: str = "",
+        system_prompt: str = "",
     ):
         super().__init__()
         self.client = client
@@ -971,6 +995,7 @@ class SummaryThread(QThread):
         self.extra_prompt = extra_prompt
         self.shared_context = shared_context
         self.current_route = current_route
+        self.system_prompt = system_prompt
 
     def run(self):
         last_error = None
@@ -984,6 +1009,7 @@ class SummaryThread(QThread):
                     extra_prompt=self.extra_prompt,
                     shared_context=self.shared_context,
                     current_route=self.current_route,
+                    system_prompt=self.system_prompt,
                 )
                 break
             except Exception as e:
@@ -1761,6 +1787,13 @@ class SettingsPage(QWidget):
             "判断识别结果与上一句是否算重复。越大越少判为重复，可能重复记录；"
             "越小越易判为重复，可能误删相似台词。建议 0.75-0.95，默认 0.85。"
         ))
+        self.chk_save_ocr_text = QCheckBox("保留识别原文")
+        self.chk_save_ocr_text.setChecked(bool(self.config.get("save_ocr_text", False)))
+        layout.addRow(self.chk_save_ocr_text)
+        layout.addRow(make_hint(
+            "勾选后，开始识别时在程序所在目录的「-游戏原文保存」里，按「游戏名_线路名.txt」追加每次识别结果。"
+            "同一游戏同一线路再次开始识别会继续写入同一文件，不会另建新文件。"
+        ))
         layout.addRow(self.chk_queue_mode)
 
         # 直接放进主表单，和其它输入框共用列宽。
@@ -1976,6 +2009,7 @@ class SettingsPage(QWidget):
         self.config["ocr_backend"] = backend
         self.config["summary_mode"] = self.cmb_summary_mode.currentText()
         self.config["auto_extract_key_info"] = self.chk_auto_key_info.isChecked()
+        self.config["save_ocr_text"] = self.chk_save_ocr_text.isChecked()
         self.config["theme"] = "dark" if self.cmb_theme.currentIndex() == 0 else "light"
         config_path = os.path.join(APP_DIR, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
@@ -2898,6 +2932,237 @@ class KeyInfoPage(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# 提示词配置
+# ---------------------------------------------------------------------------
+class PromptEditDialog(BaseDialog):
+    def __init__(self, title_text: str = "", system_prompt: str = "", heading: str = "编辑提示词", parent=None):
+        super().__init__(heading, parent)
+        self.resize(680, 560)
+        self.prompt_title = title_text
+        self.system_prompt = system_prompt
+
+        self.txt_title = QLineEdit(title_text)
+        self.body.addWidget(QLabel("标题"))
+        self.body.addWidget(self.txt_title)
+
+        self.txt_system = QTextEdit()
+        self.txt_system.setAcceptRichText(False)
+        self.txt_system.setPlainText(system_prompt)
+        self.body.addWidget(QLabel("系统提示词"))
+        self.body.addWidget(self.txt_system, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("取消")
+        set_variant(btn_cancel, "ghost")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_save = QPushButton("保存")
+        set_variant(btn_save, "primary")
+        btn_save.clicked.connect(self._save)
+        btn_row.addWidget(btn_save)
+        self.body.addLayout(btn_row)
+
+    def _save(self):
+        title = self.txt_title.text().strip()
+        system = self.txt_system.toPlainText().strip()
+        if not title or not system:
+            QMessageBox.warning(self, "不能为空", "标题和系统提示词都不能为空。")
+            return
+        self.prompt_title = title
+        self.system_prompt = system
+        self.accept()
+
+
+class PromptConfigPage(QWidget):
+    def __init__(self, db: Database, parent=None):
+        super().__init__(parent)
+        self.db = db
+        self._loading = False
+        self._init_ui()
+
+    def _init_ui(self):
+        page = QVBoxLayout(self)
+        page.setContentsMargins(16, 14, 16, 14)
+        page.setSpacing(12)
+        page.addWidget(make_caption("提示词 · PROMPTS"))
+
+        card = make_card()
+        card_layout = QVBoxLayout(card)
+        card_layout.setContentsMargins(18, 16, 18, 16)
+        card_layout.setSpacing(12)
+
+        hint = QLabel("勾选启用。设为当前后，剧情总结会使用该系统提示词。至少保留一条，且至少启用一条。")
+        set_cls(hint, "dim")
+        hint.setWordWrap(True)
+        card_layout.addWidget(hint)
+
+        user_line = QLabel(f"用户提示词（固定，不可改）：{SUMMARY_USER_TAIL}")
+        set_cls(user_line, "dim")
+        user_line.setWordWrap(True)
+        card_layout.addWidget(user_line)
+
+        body = QHBoxLayout()
+        body.setSpacing(12)
+        self.list = QListWidget()
+        self.list.setMinimumWidth(220)
+        self.list.currentItemChanged.connect(self._show_preview)
+        self.list.itemChanged.connect(self._on_item_changed)
+        body.addWidget(self.list, 2)
+
+        preview_col = QVBoxLayout()
+        preview_col.setSpacing(6)
+        preview_title = QLabel("系统提示词预览")
+        set_cls(preview_title, "dim")
+        preview_col.addWidget(preview_title)
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setAcceptRichText(False)
+        preview_col.addWidget(self.preview, 1)
+        body.addLayout(preview_col, 3)
+        card_layout.addLayout(body, 1)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+        self.btn_add = QPushButton("新增")
+        set_variant(self.btn_add, "primary")
+        self.btn_add.clicked.connect(self._add)
+        self.btn_edit = QPushButton("编辑")
+        set_variant(self.btn_edit, "ghost")
+        self.btn_edit.clicked.connect(self._edit)
+        self.btn_delete = QPushButton("删除")
+        set_variant(self.btn_delete, "ghost")
+        self.btn_delete.clicked.connect(self._delete)
+        self.btn_select = QPushButton("设为当前")
+        set_variant(self.btn_select, "ghost")
+        self.btn_select.clicked.connect(self._select)
+        btn_row.addWidget(self.btn_add)
+        btn_row.addWidget(self.btn_edit)
+        btn_row.addWidget(self.btn_delete)
+        btn_row.addWidget(self.btn_select)
+        btn_row.addStretch()
+        card_layout.addLayout(btn_row)
+
+        page.addWidget(card, 1)
+        self.reload()
+
+    def _current_id(self) -> Optional[int]:
+        item = self.list.currentItem()
+        if not item:
+            return None
+        return item.data(Qt.ItemDataRole.UserRole)
+
+    def reload(self, keep_id: Optional[int] = None):
+        if keep_id is None:
+            keep_id = self._current_id()
+        prompts = self.db.list_summary_prompts()
+        self._loading = True
+        self.list.blockSignals(True)
+        self.list.clear()
+        select_row = 0
+        for index, prompt in enumerate(prompts):
+            title = (prompt.get("title") or "未命名").strip() or "未命名"
+            if prompt.get("selected"):
+                title = f"{title}（当前）"
+                if keep_id is None:
+                    select_row = index
+            item = QListWidgetItem(title)
+            item.setFlags(
+                item.flags()
+                | Qt.ItemFlag.ItemIsUserCheckable
+                | Qt.ItemFlag.ItemIsSelectable
+                | Qt.ItemFlag.ItemIsEnabled
+            )
+            item.setCheckState(
+                Qt.CheckState.Checked if prompt.get("enabled") else Qt.CheckState.Unchecked
+            )
+            item.setData(Qt.ItemDataRole.UserRole, prompt["id"])
+            item.setData(Qt.ItemDataRole.UserRole + 1, prompt.get("system_prompt") or "")
+            item.setData(Qt.ItemDataRole.UserRole + 2, 1 if prompt.get("enabled") else 0)
+            item.setData(Qt.ItemDataRole.UserRole + 3, (prompt.get("title") or "").strip())
+            self.list.addItem(item)
+            if keep_id is not None and prompt["id"] == keep_id:
+                select_row = index
+        self.list.blockSignals(False)
+        self._loading = False
+        if self.list.count():
+            self.list.setCurrentRow(select_row)
+        else:
+            self.preview.clear()
+        self.btn_delete.setEnabled(len(prompts) > 1)
+        self._show_preview()
+
+    def _show_preview(self, *_args):
+        item = self.list.currentItem()
+        if not item:
+            self.preview.clear()
+            return
+        self.preview.setPlainText(item.data(Qt.ItemDataRole.UserRole + 1) or "")
+
+    def _on_item_changed(self, item: QListWidgetItem):
+        if self._loading:
+            return
+        prompt_id = item.data(Qt.ItemDataRole.UserRole)
+        enabled = item.checkState() == Qt.CheckState.Checked
+        was = bool(item.data(Qt.ItemDataRole.UserRole + 2))
+        if enabled == was:
+            return
+        err = self.db.set_summary_prompt_enabled(prompt_id, enabled)
+        if err:
+            QMessageBox.warning(self, "无法关闭", err)
+        self.reload(keep_id=prompt_id)
+
+    def _add(self):
+        dialog = PromptEditDialog(heading="新增提示词", parent=self.window())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        new_id = self.db.add_summary_prompt(dialog.prompt_title, dialog.system_prompt, enabled=True)
+        self.reload(keep_id=new_id)
+
+    def _edit(self):
+        item = self.list.currentItem()
+        if not item:
+            QMessageBox.information(self, "未选择", "请先选中一条提示词。")
+            return
+        dialog = PromptEditDialog(
+            title_text=item.data(Qt.ItemDataRole.UserRole + 3) or "",
+            system_prompt=item.data(Qt.ItemDataRole.UserRole + 1) or "",
+            heading="编辑提示词",
+            parent=self.window(),
+        )
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        prompt_id = item.data(Qt.ItemDataRole.UserRole)
+        self.db.update_summary_prompt(prompt_id, dialog.prompt_title, dialog.system_prompt)
+        self.reload(keep_id=prompt_id)
+
+    def _delete(self):
+        prompt_id = self._current_id()
+        if prompt_id is None:
+            QMessageBox.information(self, "未选择", "请先选中一条提示词。")
+            return
+        reply = QMessageBox.question(self, "确认删除", "确定删除这条提示词吗？")
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        err = self.db.delete_summary_prompt(prompt_id)
+        if err:
+            QMessageBox.warning(self, "无法删除", err)
+            return
+        self.reload(keep_id=None)
+
+    def _select(self):
+        prompt_id = self._current_id()
+        if prompt_id is None:
+            QMessageBox.information(self, "未选择", "请先选中一条提示词。")
+            return
+        err = self.db.select_summary_prompt(prompt_id)
+        if err:
+            QMessageBox.warning(self, "无法设为当前", err)
+            return
+        self.reload(keep_id=prompt_id)
+
+
+# ---------------------------------------------------------------------------
 # 主窗口
 # ---------------------------------------------------------------------------
 class MainWindow(QMainWindow):
@@ -2958,6 +3223,9 @@ class MainWindow(QMainWindow):
         self._queue_timer = QTimer(self)
         self._queue_timer.setInterval(500)
         self._queue_timer.timeout.connect(self._on_queue_tick)
+        self._inflight_summary_text = ""
+        self._queue_table_sig = None
+        self._ocr_transcript_logged = False
 
         self.current_game_id: Optional[int] = self.config.get("last_game_id")
         self.current_route_id: Optional[int] = self.config.get("last_route_id")
@@ -3093,7 +3361,7 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         for idx, (glyph, text) in enumerate(
-            [("▣", "主界面"), ("≡", "剧情总结"), ("✦", "关键信息"), ("▤", "游戏管理"), ("⚙", "设置")]
+            [("▣", "主界面"), ("≡", "剧情总结"), ("✦", "关键信息"), ("▤", "游戏管理"), ("✎", "提示词配置"), ("⚙", "设置")]
         ):
             btn = NavButton(glyph, text)
             self.nav_group.addButton(btn, idx)
@@ -3122,12 +3390,14 @@ class MainWindow(QMainWindow):
         self.gameroute_page = GameRoutePage(self.db)
         self.gameroute_page.data_changed.connect(self._on_game_data_changed)
         self.gameroute_page.route_chosen.connect(self._on_route_chosen)
+        self.prompt_page = PromptConfigPage(self.db)
         self.settings_page = SettingsPage(self.config)
         self.settings_page.saved.connect(self._on_settings_saved)
         self.stack.addWidget(self.dashboard_page)
         self.stack.addWidget(self.timeline_page)
         self.stack.addWidget(self.keyinfo_page)
         self.stack.addWidget(self.gameroute_page)
+        self.stack.addWidget(self.prompt_page)
         self.stack.addWidget(self.settings_page)
         self.nav_group.button(0).setChecked(True)
 
@@ -3308,14 +3578,19 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.txt_log, "识别日志")
 
         # 队列 tab：总结任务的锚点、帧区间与状态（仅队列模式）
-        self.tbl_queue = QTableWidget(0, 4)
-        self.tbl_queue.setHorizontalHeaderLabels(["锚点帧", "帧区间", "状态", "入队时间"])
+        self.tbl_queue = QTableWidget(0, 5)
+        self.tbl_queue.setHorizontalHeaderLabels(["锚点帧", "帧区间", "状态", "入队时间", "操作"])
         self.tbl_queue.verticalHeader().setVisible(False)
         self.tbl_queue.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.tbl_queue.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
         self.tbl_queue.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
         )
+        self.tbl_queue.horizontalHeader().setSectionResizeMode(
+            4, QHeaderView.ResizeMode.ResizeToContents
+        )
+        self.tbl_queue.verticalHeader().setDefaultSectionSize(36)
+        self._queue_table_sig = None
         self._queue_tab_index = -1
         if self._queue_mode:
             self._queue_tab_index = self.tabs.addTab(self.tbl_queue, "总结队列")
@@ -3335,6 +3610,8 @@ class MainWindow(QMainWindow):
         elif index == 3:
             self.gameroute_page.set_current(self.current_game_id)
             self.gameroute_page.reload()
+        elif index == 4:
+            self.prompt_page.reload()
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -3433,8 +3710,8 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self):
         """切换到设置页面"""
-        self.nav_group.button(4).setChecked(True)
-        self._switch_page(4)
+        self.nav_group.button(5).setChecked(True)
+        self._switch_page(5)
 
     def _on_game_combo_changed(self):
         self._populate_route_combo(self.cmb_game.currentData())
@@ -3685,6 +3962,7 @@ class MainWindow(QMainWindow):
         self.status_window.set_manual_mode(self.config.get("summary_mode", "auto") == "manual")
 
         self.txt_log.append("开始 OCR 识别...")
+        self._prepare_ocr_transcript()
         if self._queue_mode:
             # 换线路才清空；同线路暂停后继续时保留未总结的帧文本与排队任务
             if self._queue_route_id != self.current_route_id:
@@ -3790,10 +4068,58 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # OCR 文本处理与总结触发
     # ------------------------------------------------------------------
+    def _ocr_transcript_path(self) -> str:
+        game = self.db.get_game(self.current_game_id) if self.current_game_id else None
+        route = self.db.get_route(self.current_route_id) if self.current_route_id else None
+        game_name = _safe_path_part((game or {}).get("name") or "未命名游戏")
+        route_name = _safe_path_part((route or {}).get("name") or "未命名线路")
+        folder = os.path.join(APP_DIR, "-游戏原文保存")
+        return os.path.join(folder, f"{game_name}_{route_name}.txt")
+
+    def _prepare_ocr_transcript(self):
+        """开始识别时确保原文文件存在。同一游戏同一线路始终追加，不另建文件。"""
+        self._ocr_transcript_logged = False
+        if not self.config.get("save_ocr_text"):
+            return
+        path = self._ocr_transcript_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            if not os.path.exists(path):
+                with open(path, "w", encoding="utf-8-sig", newline="\n") as handle:
+                    handle.write("")
+            self.txt_log.append(f"[原文] 识别原文追加到 {path}")
+            self._ocr_transcript_logged = True
+        except Exception as exc:
+            self.txt_log.append(f"[原文] 无法创建原文文件：{exc}")
+
+    def _append_ocr_transcript(self, text: str):
+        if not self.config.get("save_ocr_text"):
+            return
+        body = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not body:
+            return
+        path = self._ocr_transcript_path()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            new_file = not os.path.exists(path)
+            encoding = "utf-8-sig" if new_file else "utf-8"
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            with open(path, "a", encoding=encoding, newline="\n") as handle:
+                handle.write(f"[{stamp}]\n{body}\n\n")
+                handle.flush()
+            if not self._ocr_transcript_logged:
+                self.txt_log.append(f"[原文] 识别原文追加到 {path}")
+                self._ocr_transcript_logged = True
+        except Exception as exc:
+            if not self._ocr_transcript_logged:
+                self.txt_log.append(f"[原文] 写入失败：{exc}")
+                self._ocr_transcript_logged = True
+
     def _on_ocr_text(self, text: str):
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         self.txt_current.setText(text)
         self.txt_log.append(f"[{now_str}] {text}")
+        self._append_ocr_transcript(text)
         self.status_window.update_state(current=text)
 
         with self.buffer_lock:
@@ -3865,6 +4191,7 @@ class MainWindow(QMainWindow):
         self._frames_enqueued = 0
         self._frames_dropped = 0
         self._frame_seq_base = 0
+        self._queue_table_sig = None
 
     def _advance_recognized_water(self, frame_id: int):
         """推进连续完成水位：只有 1..N 全部有结果时水位才到 N。"""
@@ -3910,6 +4237,7 @@ class MainWindow(QMainWindow):
             now_str = datetime.datetime.now().strftime("%H:%M:%S")
             self.txt_current.setText(text)
             self.txt_log.append(f"[{now_str}] [帧{frame_id}] {text}")
+            self._append_ocr_transcript(text)
             with self.buffer_lock:
                 self.frame_texts.append((frame_id, text))
 
@@ -3989,6 +4317,22 @@ class MainWindow(QMainWindow):
             return
         while self.summary_queue:
             task = self.summary_queue[0]
+            if task.state == "待重试":
+                self.summary_queue.popleft()
+                text = (task.raw_text or "").strip()
+                if not text:
+                    task.state = "失败"
+                    task.error = task.error or "原文已丢失，无法重试"
+                    self.txt_log.append(
+                        f"[队列] 帧 {task.start_frame_id + 1}-{task.anchor_frame_id} 原文已丢失，无法重试"
+                    )
+                    continue
+                task.state = "总结中"
+                task.error = ""
+                self._current_summary_task = task
+                self._start_queued_summary(text, task.session_id)
+                self._update_queue_ui()
+                return
             if task.anchor_frame_id > self._recognized_upto:
                 task.state = "等待识别"
                 self._update_queue_ui()
@@ -3997,11 +4341,14 @@ class MainWindow(QMainWindow):
             text = self._take_frame_texts(task.start_frame_id, task.anchor_frame_id)
             if not text.strip():
                 task.state = "已跳过"
+                task.raw_text = ""
                 self.txt_log.append(
                     f"[队列] 帧 {task.start_frame_id + 1}-{task.anchor_frame_id} 无有效文本，跳过总结"
                 )
                 self.toasts.show("这段没识别到文字，已跳过总结", kind="warn", duration_ms=4000)
                 continue
+            task.raw_text = text
+            task.error = ""
             task.state = "总结中"
             self._current_summary_task = task
             self._start_queued_summary(text, task.session_id)
@@ -4025,6 +4372,7 @@ class MainWindow(QMainWindow):
             extra_prompt=self._game_prompt(),
             shared_context=shared_context,
             current_route=route_name,
+            system_prompt=self._summary_system_prompt(),
         )
         self.summary_thread.summary_ready.connect(self._on_summary_ready)
         self.summary_thread.error.connect(self._on_summary_error)
@@ -4089,7 +4437,7 @@ class MainWindow(QMainWindow):
 
         task_total = len(self._summary_task_log)
         task_done = sum(
-            1 for t in self._summary_task_log if t.state in ("已完成", "已跳过", "失败")
+            1 for t in self._summary_task_log if t.state in ("已完成", "已跳过")
         )
         waiting = self._summary_queue_waiting()
         self.bar_queue_summary.setMaximum(max(1, task_total))
@@ -4111,10 +4459,42 @@ class MainWindow(QMainWindow):
         self.status_window.update_queue_progress(done, total, waiting)
         self._refresh_queue_table()
 
+    def _retry_summary_task(self, task: SummaryTask):
+        text = (task.raw_text or "").strip()
+        if not text:
+            self.toasts.show("这段原文已经不在了，无法重试", kind="warn", duration_ms=4000)
+            return
+        if task.state in ("总结中", "待重试"):
+            return
+        task.state = "待重试"
+        task.error = ""
+        if not any(item is task for item in self.summary_queue):
+            self.summary_queue.appendleft(task)
+        self.txt_log.append(
+            f"[队列] 重试总结：帧 {task.start_frame_id + 1}-{task.anchor_frame_id}"
+        )
+        self.toasts.show("已重新加入总结队列", kind="info")
+        self._pump_summary_queue()
+        self._update_queue_ui()
+
+    def _visible_summary_tasks(self) -> list:
+        """失败和未完成的任务始终留在表里，方便重试。"""
+        pinned = {
+            id(task) for task in self._summary_task_log
+            if task.state not in ("已完成", "已跳过")
+        }
+        tail = {id(task) for task in self._summary_task_log[-50:]}
+        show = pinned | tail
+        return [task for task in self._summary_task_log if id(task) in show]
+
     def _refresh_queue_table(self):
         if not hasattr(self, "tbl_queue"):
             return
-        tasks = self._summary_task_log[-50:]
+        tasks = self._visible_summary_tasks()
+        sig = tuple((id(task), task.state, task.anchor_frame_id) for task in tasks)
+        if sig == self._queue_table_sig:
+            return
+        self._queue_table_sig = sig
         self.tbl_queue.setRowCount(len(tasks))
         for row, task in enumerate(tasks):
             values = [
@@ -4126,7 +4506,20 @@ class MainWindow(QMainWindow):
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if col == 2 and task.error:
+                    item.setToolTip(task.error)
                 self.tbl_queue.setItem(row, col, item)
+            old_btn = self.tbl_queue.cellWidget(row, 4)
+            if old_btn is not None:
+                self.tbl_queue.removeCellWidget(row, 4)
+                old_btn.deleteLater()
+            if task.state == "失败" and (task.raw_text or "").strip():
+                btn = QPushButton("重试")
+                set_variant(btn, "ghost")
+                btn.setFixedHeight(26)
+                btn.setToolTip("用这段已识别原文再总结一次")
+                btn.clicked.connect(lambda _checked=False, current=task: self._retry_summary_task(current))
+                self.tbl_queue.setCellWidget(row, 4, btn)
 
     def _game_prompt(self) -> str:
         """当前游戏的追加提示词（总结/信息提取时拼入 system prompt）"""
@@ -4144,6 +4537,16 @@ class MainWindow(QMainWindow):
         route = self.db.get_route(self.current_route_id) or {}
         return self.db.format_shared_context(self.current_route_id), route.get("name") or ""
 
+    def _summary_system_prompt(self) -> str:
+        try:
+            row = self.db.get_active_summary_prompt()
+            text = ((row or {}).get("system_prompt") or "").strip()
+            if text:
+                return text
+        except Exception:
+            pass
+        return SUMMARY_PROMPT_BRIEF
+
     def _trigger_summary(self, session_id: Optional[int] = None):
         with self.buffer_lock:
             if not self.text_buffer or self._summarizing:
@@ -4156,6 +4559,7 @@ class MainWindow(QMainWindow):
 
         self._summary_session_id = session_id or self._current_session_id or self._last_session_id
         self._summarizing = True
+        self._inflight_summary_text = recent_text
         self.btn_summarize_main.setEnabled(False)
         self._set_status("识别中")
         self._set_summary_status("总结中")
@@ -4170,6 +4574,7 @@ class MainWindow(QMainWindow):
             extra_prompt=self._game_prompt(),
             shared_context=shared_context,
             current_route=route_name,
+            system_prompt=self._summary_system_prompt(),
         )
         self.summary_thread.summary_ready.connect(self._on_summary_ready)
         self.summary_thread.error.connect(self._on_summary_error)
@@ -4262,9 +4667,12 @@ class MainWindow(QMainWindow):
     def _on_summary_ready(self, summary: str, raw_text: str, key_info_json: str, title: str = ""):
         self._summarizing = False
         self.btn_summarize_main.setEnabled(True)
+        self._inflight_summary_text = ""
         self.previous_summary = summary
         if self._current_summary_task is not None:
             self._current_summary_task.state = "已完成"
+            self._current_summary_task.raw_text = ""
+            self._current_summary_task.error = ""
             self._current_summary_task = None
 
         # 持久化总结
@@ -4341,13 +4749,22 @@ class MainWindow(QMainWindow):
         self.btn_summarize_main.setEnabled(True)
         if self._current_summary_task is not None:
             self._current_summary_task.state = "失败"
+            self._current_summary_task.error = msg
             self._current_summary_task = None
+        elif self._inflight_summary_text:
+            with self.buffer_lock:
+                self.text_buffer.insert(0, self._inflight_summary_text)
+            self.manual_sentence_count = self._count_sentences("\n".join(self.text_buffer))
+            self.status_window.update_count(self.manual_sentence_count)
+            self.txt_log.append("[总结] 失败的原文已放回缓冲区，可再次点击总结")
+        self._inflight_summary_text = ""
         self.txt_summary.append(f"[总结错误] {msg}")
         self.toasts.show(f"总结失败：{msg}", kind="error", duration_ms=6000)
         self._set_summary_status("总结失败")
         self.status_window.update_summary_state("总结失败")
         QTimer.singleShot(2000, self._restore_running_status)
         if self._queue_mode:
+            self._update_queue_ui()
             self._pump_summary_queue()
 
     def _on_summary_thread_finished(self):

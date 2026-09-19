@@ -4,6 +4,41 @@ from typing import Optional
 import requests
 
 
+SUMMARY_USER_TAIL = "请用连贯的叙述按顺序总结本段剧情"
+
+# 预置系统提示词。用户可在「提示词配置」里改写，这里只作首次写入数据库的底稿。
+SUMMARY_PROMPT_DETAILED = (
+    "你正在陪用户玩Galgame。请根据OCR识别出的游戏文本，结合之前的剧情总结，"
+    "用中文总结当前剧情。总结要内容充实、篇幅适当加长，尽量完整保留以下有效信息："
+    "出场人物及其名字、对话要点、行为动机与人物关系；重要事件的完整经过与前因后果；"
+    "伏笔、线索以及对后续剧情可能有影响的细节；涉及的世界观、地点、组织等设定；"
+    "以及明显的情感变化。宁可保留更多细节，也不要过度精简丢失线索。"
+    "不要添加任何前缀或标题（如“剧情总结：”），直接输出总结内容。"
+    "剧情总结只写当前线路已经发生的事，不要把其他线路的剧情写进来。"
+)
+
+SUMMARY_PROMPT_BRIEF = (
+    "你正在陪用户玩Galgame。请根据OCR识别出的游戏文本，结合之前的剧情总结，"
+    "用中文写成一段连贯叙述。不要分点，不要小标题，不要「情节：」「线索：」「设定：」「人物关系：」这类标签，"
+    "也不要在段尾再概括一遍。"
+    "按时间顺序把事情写完，前后要接得上。线索、设定、人物关系出现在哪件事里，就写在那句话里，"
+    "作为叙述的一部分，而不是单独列出来。"
+    "每件事写清谁、做了什么、结果是什么。必须保留：人物名字与身份；这段里新出现或发生变化的人物关系；"
+    "决定、约定、拒绝、冲突和转折；关键线索、伏笔、物品、地点、组织、规则；"
+    "会改变后续理解的关键台词，用简短引号嵌在句子里。"
+    "神态、动作、注视、转身等，只在能体现关键情节或人物关系时写进句子，其余省略。"
+    "寒暄、重复感叹、没有新信息的内心感慨不要写。没有新情报的过场用一两句话带过。"
+    "篇幅随情节多少而定，不要为了写满而加长。"
+    "不要添加任何前缀或标题（如“剧情总结：”），直接输出正文。"
+    "只写当前线路已经发生的事，不要把其他线路的剧情写进来。"
+)
+
+BUILTIN_SUMMARY_PROMPTS = (
+    {"builtin_key": "detailed", "title": "详细模式", "system_prompt": SUMMARY_PROMPT_DETAILED, "selected": 0},
+    {"builtin_key": "brief", "title": "简略模式", "system_prompt": SUMMARY_PROMPT_BRIEF, "selected": 1},
+)
+
+
 class LLMClient:
     def __init__(self, config: dict):
         self.base_url = config["base_url"].rstrip("/")
@@ -33,16 +68,9 @@ class LLMClient:
         extra_prompt: str = "",
         shared_context: str = "",
         current_route: str = "",
+        system_prompt: str = "",
     ) -> str:
-        system = (
-            "你正在陪用户玩Galgame。请根据OCR识别出的游戏文本，结合之前的剧情总结，"
-            "用中文总结当前剧情。总结要内容充实、篇幅适当加长，尽量完整保留以下有效信息："
-            "出场人物及其名字、对话要点、行为动机与人物关系；重要事件的完整经过与前因后果；"
-            "伏笔、线索以及对后续剧情可能有影响的细节；涉及的世界观、地点、组织等设定；"
-            "以及明显的情感变化。宁可保留更多细节，也不要过度精简丢失线索。"
-            "不要添加任何前缀或标题（如“剧情总结：”），直接输出总结内容。"
-            "剧情总结只写当前线路已经发生的事，不要把其他线路的剧情写进来。"
-        )
+        system = (system_prompt or "").strip() or SUMMARY_PROMPT_BRIEF
         if shared_context:
             system += (
                 "\n\n同一游戏的剧情线索、世界观设定和角色信息在各线路之间共享。"
@@ -60,7 +88,7 @@ class LLMClient:
             user += f"已有共享信息（全游戏，不是本线路剧情）：\n{shared_context}\n\n"
         if previous_summary:
             user += f"之前的剧情总结：\n{previous_summary}\n\n"
-        user += f"最近识别到的游戏文本：\n{text}\n\n请生成一段内容充实、细节完整的中文剧情总结："
+        user += f"最近识别到的游戏文本：\n{text}\n\n{SUMMARY_USER_TAIL}"
 
         return self._chat(
             [

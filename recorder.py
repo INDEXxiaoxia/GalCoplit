@@ -133,6 +133,7 @@ class Database:
                 """
             )
             self._migrate_shared_knowledge(conn)
+            self._migrate_summary_prompts(conn)
             conn.commit()
 
     def _migrate_legacy(self, conn: sqlite3.Connection):
@@ -241,6 +242,61 @@ class Database:
                     "UPDATE characters SET name=?, info=? WHERE id=?",
                     (merged_name, merged_info, keep_id),
                 )
+
+    def _migrate_summary_prompts(self, conn: sqlite3.Connection):
+        """旧库没有提示词表时补上，并写入预置的详细/简略两种系统提示词。"""
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS summary_prompts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL DEFAULT '',
+                system_prompt TEXT NOT NULL DEFAULT '',
+                enabled INTEGER NOT NULL DEFAULT 1,
+                selected INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0,
+                builtin_key TEXT DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+            """
+        )
+        alters = {
+            "title": "TEXT DEFAULT ''",
+            "system_prompt": "TEXT DEFAULT ''",
+            "enabled": "INTEGER DEFAULT 1",
+            "selected": "INTEGER DEFAULT 0",
+            "sort_order": "INTEGER DEFAULT 0",
+            "builtin_key": "TEXT DEFAULT ''",
+            "created_at": "TEXT DEFAULT ''",
+            "updated_at": "TEXT DEFAULT ''",
+        }
+        cols = self._table_columns(conn, "summary_prompts")
+        for name, ddl in alters.items():
+            if name not in cols:
+                conn.execute(f"ALTER TABLE summary_prompts ADD COLUMN {name} {ddl}")
+        count = conn.execute("SELECT COUNT(*) FROM summary_prompts").fetchone()[0]
+        if count:
+            return
+        from llm_client import BUILTIN_SUMMARY_PROMPTS
+
+        now = datetime.datetime.now().isoformat()
+        for index, item in enumerate(BUILTIN_SUMMARY_PROMPTS, start=1):
+            conn.execute(
+                """
+                INSERT INTO summary_prompts
+                    (title, system_prompt, enabled, selected, sort_order, builtin_key, created_at, updated_at)
+                VALUES (?, ?, 1, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item["title"],
+                    item["system_prompt"],
+                    int(item["selected"]),
+                    index,
+                    item["builtin_key"],
+                    now,
+                    now,
+                ),
+            )
 
     # ------------------------------------------------------------------
     # 游戏
@@ -698,6 +754,139 @@ class Database:
         with sqlite3.connect(self.db_path) as conn:
             conn.execute("DELETE FROM characters WHERE id=?", (char_id,))
             conn.commit()
+
+    # ------------------------------------------------------------------
+    # 剧情总结提示词
+    # ------------------------------------------------------------------
+    def list_summary_prompts(self) -> List[Dict[str, Any]]:
+        with sqlite3.connect(self.db_path) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = conn.execute(
+                "SELECT * FROM summary_prompts ORDER BY sort_order ASC, id ASC"
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def get_active_summary_prompt(self) -> Optional[Dict[str, Any]]:
+        prompts = self.list_summary_prompts()
+        if not prompts:
+            return None
+        for item in prompts:
+            if item.get("selected") and item.get("enabled"):
+                return item
+        for item in prompts:
+            if item.get("enabled"):
+                return item
+        return prompts[0]
+
+    def add_summary_prompt(self, title: str, system_prompt: str, enabled: bool = True) -> int:
+        now = datetime.datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            order = conn.execute(
+                "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM summary_prompts"
+            ).fetchone()[0]
+            selected = 0
+            if not conn.execute("SELECT 1 FROM summary_prompts LIMIT 1").fetchone():
+                selected = 1
+                enabled = True
+            cur = conn.execute(
+                """
+                INSERT INTO summary_prompts
+                    (title, system_prompt, enabled, selected, sort_order, builtin_key, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, '', ?, ?)
+                """,
+                (title.strip(), system_prompt.strip(), 1 if enabled else 0, selected, order, now, now),
+            )
+            conn.commit()
+            return cur.lastrowid
+
+    def update_summary_prompt(self, prompt_id: int, title: str, system_prompt: str):
+        now = datetime.datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute(
+                "UPDATE summary_prompts SET title=?, system_prompt=?, updated_at=? WHERE id=?",
+                (title.strip(), system_prompt.strip(), now, prompt_id),
+            )
+            conn.commit()
+
+    def set_summary_prompt_enabled(self, prompt_id: int, enabled: bool) -> str:
+        """关闭时至少留一个启用项。若关掉的是当前项，改选另一个已启用的。"""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT selected FROM summary_prompts WHERE id=?", (prompt_id,)
+            ).fetchone()
+            if not row:
+                return "提示词不存在"
+            if not enabled:
+                others = conn.execute(
+                    "SELECT COUNT(*) FROM summary_prompts WHERE enabled=1 AND id<>?",
+                    (prompt_id,),
+                ).fetchone()[0]
+                if not others:
+                    return "至少保留一个启用的提示词"
+            now = datetime.datetime.now().isoformat()
+            conn.execute(
+                "UPDATE summary_prompts SET enabled=?, updated_at=? WHERE id=?",
+                (1 if enabled else 0, now, prompt_id),
+            )
+            if not enabled and row[0]:
+                nxt = conn.execute(
+                    "SELECT id FROM summary_prompts WHERE enabled=1 AND id<>? ORDER BY sort_order ASC, id ASC LIMIT 1",
+                    (prompt_id,),
+                ).fetchone()
+                conn.execute("UPDATE summary_prompts SET selected=0")
+                if nxt:
+                    conn.execute(
+                        "UPDATE summary_prompts SET selected=1, updated_at=? WHERE id=?",
+                        (now, nxt[0]),
+                    )
+            conn.commit()
+        return ""
+
+    def select_summary_prompt(self, prompt_id: int) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT enabled FROM summary_prompts WHERE id=?", (prompt_id,)
+            ).fetchone()
+            if not row:
+                return "提示词不存在"
+            if not row[0]:
+                return "请先启用该提示词"
+            now = datetime.datetime.now().isoformat()
+            conn.execute("UPDATE summary_prompts SET selected=0")
+            conn.execute(
+                "UPDATE summary_prompts SET selected=1, updated_at=? WHERE id=?",
+                (now, prompt_id),
+            )
+            conn.commit()
+        return ""
+
+    def delete_summary_prompt(self, prompt_id: int) -> str:
+        with sqlite3.connect(self.db_path) as conn:
+            total = conn.execute("SELECT COUNT(*) FROM summary_prompts").fetchone()[0]
+            if total <= 1:
+                return "至少保留一个提示词，最后一个不能删除"
+            row = conn.execute(
+                "SELECT selected, enabled FROM summary_prompts WHERE id=?", (prompt_id,)
+            ).fetchone()
+            if not row:
+                return "提示词不存在"
+            conn.execute("DELETE FROM summary_prompts WHERE id=?", (prompt_id,))
+            if row[0]:
+                nxt = conn.execute(
+                    """
+                    SELECT id FROM summary_prompts
+                    ORDER BY enabled DESC, sort_order ASC, id ASC
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if nxt:
+                    conn.execute("UPDATE summary_prompts SET selected=0")
+                    conn.execute(
+                        "UPDATE summary_prompts SET selected=1, enabled=1 WHERE id=?",
+                        (nxt[0],),
+                    )
+            conn.commit()
+        return ""
 
     # ------------------------------------------------------------------
     # 拖动排序

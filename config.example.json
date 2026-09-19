@@ -8,6 +8,7 @@
   "ocr_backend": "rapid",
   "tesseract_path": "",
   "auto_extract_key_info": true,
+  "save_ocr_text": false,
   "summary_mode": "auto",
   "queue_mode": true,
   "queue_backlog_limit": 300,
