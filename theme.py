@@ -424,6 +424,26 @@ QListWidget::item { padding: 9px 10px; border-radius: 6px; color: $text_dim; mar
 QListWidget::item:hover { background-color: $btn_bg; color: $text; }
 QListWidget::item:selected { background-color: $accent_soft; color: $text; }
 
+/* 全局 QWidget 背景是透明的，表头不单独设色时会画成黑底。浅色模式字也是深色，表头就看不见。 */
+QTableWidget {
+    background-color: $input_bg;
+    color: $text;
+    border: 1px solid $border;
+    border-radius: 8px;
+    gridline-color: $border;
+}
+QTableWidget::item { color: $text; background: transparent; padding: 4px 6px; }
+QHeaderView { background-color: $surface2; border: none; }
+QHeaderView::section {
+    background-color: $surface2;
+    color: $text;
+    border: none;
+    border-right: 1px solid $border;
+    border-bottom: 1px solid $border;
+    padding: 6px 8px;
+    font-weight: 600;
+}
+
 QTabWidget::pane { border: none; }
 QTabBar { background: transparent; }
 QTabBar::tab {

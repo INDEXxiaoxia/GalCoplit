@@ -969,6 +969,8 @@ class SummaryTask:
     created_at: datetime.datetime = field(default_factory=datetime.datetime.now)
     raw_text: str = ""
     error: str = ""
+    queue_seq: int = 0
+    summary_id: Optional[int] = None
 
 
 class SummaryThread(QThread):
@@ -1633,6 +1635,7 @@ class SettingsPage(QWidget):
         super().__init__(parent)
         self.config = config
         self._paddle_installing = False
+        self._loading = False
         self._init_ui()
 
     def _init_ui(self):
@@ -1828,17 +1831,7 @@ class SettingsPage(QWidget):
         self._on_backend_changed()
         self._on_summary_mode_changed(self.cmb_summary_mode.currentText())
         self._on_queue_mode_changed(self.chk_queue_mode.isChecked())
-
-        btn_row = QHBoxLayout()
-        self.lbl_saved_hint = QLabel("")
-        set_cls(self.lbl_saved_hint, "dim")
-        btn_row.addWidget(self.lbl_saved_hint)
-        btn_row.addStretch()
-        btn_save = QPushButton("保存设置")
-        set_variant(btn_save, "primary")
-        btn_save.clicked.connect(self._save)
-        btn_row.addWidget(btn_save)
-        card_layout.addLayout(btn_row)
+        self._bind_autosave()
 
         # 设置项带说明后内容较长，放进滚动区避免小窗口下被裁掉
         scroll = QScrollArea()
@@ -1977,9 +1970,33 @@ class SettingsPage(QWidget):
         form.setRowVisible(self._row_legacy_queue, not enabled)
         form.setRowVisible(self._row_legacy_queue_hint, not enabled)
 
-    def _save(self):
+    def _bind_autosave(self):
+        for edit in (self.txt_base_url, self.txt_api_key, self.txt_model, self.txt_tesseract_path):
+            edit.editingFinished.connect(self._save)
+        for spin in (
+            self.spin_ocr_interval,
+            self.spin_det_limit,
+            self.spin_ocr_queue,
+            self.spin_queue_backlog,
+            self.spin_frame_diff,
+            self.spin_summary_count,
+        ):
+            spin.valueChanged.connect(self._save)
+        self.spin_text_sim.valueChanged.connect(self._save)
+        self.cmb_ocr_backend.currentIndexChanged.connect(self._save)
+        self.cmb_ocr_lang.currentIndexChanged.connect(self._save)
+        self.cmb_summary_mode.currentTextChanged.connect(self._save)
+        self.cmb_theme.currentIndexChanged.connect(self._save)
+        self.chk_queue_mode.toggled.connect(self._save)
+        self.chk_auto_key_info.toggled.connect(self._save)
+        self.chk_save_ocr_text.toggled.connect(self._save)
+
+    def _save(self, *_args):
+        if self._loading:
+            return
         backend = self._current_backend()
-        if backend in (BACKEND_CPU, BACKEND_GPU):
+        prev_backend = normalize_backend(self.config.get("ocr_backend", "rapid"))
+        if backend != prev_backend and backend in (BACKEND_CPU, BACKEND_GPU):
             status = environment_ready(backend_to_device(backend), APP_DIR)
             if not status.installed:
                 reply = QMessageBox.question(
@@ -1987,34 +2004,43 @@ class SettingsPage(QWidget):
                     "环境未通过",
                     f"当前选择了 {backend}，但环境检测未通过。\n\n"
                     f"{status.detail}\n\n"
-                    "可先点右侧「安装环境」。仍要保存该设置吗？",
+                    "可先点右侧「安装环境」。仍要使用该设置吗？",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                     QMessageBox.StandardButton.No,
                 )
                 if reply != QMessageBox.StandardButton.Yes:
+                    self._loading = True
+                    idx = self.cmb_ocr_backend.findData(prev_backend)
+                    self.cmb_ocr_backend.setCurrentIndex(idx if idx >= 0 else 0)
+                    self._on_backend_changed()
+                    self._loading = False
                     return
-        self.config["base_url"] = self.txt_base_url.text().strip()
-        self.config["api_key"] = self.txt_api_key.text().strip()
-        self.config["model"] = self.txt_model.text().strip()
-        self.config["ocr_lang"] = resolve_ocr_lang(backend, self._current_ocr_lang())
-        self.config["tesseract_path"] = self.txt_tesseract_path.text().strip()
-        self.config["ocr_interval_ms"] = self.spin_ocr_interval.value()
-        self.config["det_limit_side_len"] = self.spin_det_limit.value()
-        self.config["ocr_queue_size"] = self.spin_ocr_queue.value()
-        self.config["queue_mode"] = self.chk_queue_mode.isChecked()
-        self.config["queue_backlog_limit"] = self.spin_queue_backlog.value()
-        self.config["frame_diff_threshold"] = self.spin_frame_diff.value()
-        self.config["text_similarity_threshold"] = round(self.spin_text_sim.value(), 2)
-        self.config["summary_sentence_count"] = self.spin_summary_count.value()
-        self.config["ocr_backend"] = backend
-        self.config["summary_mode"] = self.cmb_summary_mode.currentText()
-        self.config["auto_extract_key_info"] = self.chk_auto_key_info.isChecked()
-        self.config["save_ocr_text"] = self.chk_save_ocr_text.isChecked()
-        self.config["theme"] = "dark" if self.cmb_theme.currentIndex() == 0 else "light"
+        payload = {
+            "base_url": self.txt_base_url.text().strip(),
+            "api_key": self.txt_api_key.text().strip(),
+            "model": self.txt_model.text().strip(),
+            "ocr_lang": resolve_ocr_lang(backend, self._current_ocr_lang()),
+            "tesseract_path": self.txt_tesseract_path.text().strip(),
+            "ocr_interval_ms": self.spin_ocr_interval.value(),
+            "det_limit_side_len": self.spin_det_limit.value(),
+            "ocr_queue_size": self.spin_ocr_queue.value(),
+            "queue_mode": self.chk_queue_mode.isChecked(),
+            "queue_backlog_limit": self.spin_queue_backlog.value(),
+            "frame_diff_threshold": self.spin_frame_diff.value(),
+            "text_similarity_threshold": round(self.spin_text_sim.value(), 2),
+            "summary_sentence_count": self.spin_summary_count.value(),
+            "ocr_backend": backend,
+            "summary_mode": self.cmb_summary_mode.currentText(),
+            "auto_extract_key_info": self.chk_auto_key_info.isChecked(),
+            "save_ocr_text": self.chk_save_ocr_text.isChecked(),
+            "theme": "dark" if self.cmb_theme.currentIndex() == 0 else "light",
+        }
+        if all(self.config.get(key) == value for key, value in payload.items()):
+            return
+        self.config.update(payload)
         config_path = os.path.join(APP_DIR, "config.json")
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(self.config, f, ensure_ascii=False, indent=2)
-        self.lbl_saved_hint.setText(f"已保存 {datetime.datetime.now().strftime('%H:%M:%S')}")
         self.saved.emit()
 
 
@@ -2304,7 +2330,93 @@ class GameRoutePage(QWidget):
 # ---------------------------------------------------------------------------
 # 剧情总结时间线页面
 # ---------------------------------------------------------------------------
+class CopySummaryDialog(BaseDialog):
+    def __init__(self, routes: List[dict], parent=None):
+        super().__init__("复制到其他线路", parent)
+        self.resize(440, 240)
+        hint = QLabel("把当前选中的这一段追加到目标线路末尾。目标线路还没有剧情时，它会成为第一章。")
+        hint.setWordWrap(True)
+        set_cls(hint, "dim")
+        self.body.addWidget(hint)
+        self.combo = make_combo()
+        for route in routes:
+            self.combo.addItem(route.get("name") or "未命名线路", route["id"])
+        self.body.addWidget(QLabel("目标线路"))
+        self.body.addWidget(self.combo)
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        btn_cancel = QPushButton("取消")
+        set_variant(btn_cancel, "ghost")
+        btn_cancel.clicked.connect(self.reject)
+        btn_row.addWidget(btn_cancel)
+        btn_ok = QPushButton("复制")
+        set_variant(btn_ok, "primary")
+        btn_ok.clicked.connect(self.accept)
+        btn_row.addWidget(btn_ok)
+        self.body.addLayout(btn_row)
+
+    def selected_route_id(self) -> Optional[int]:
+        value = self.combo.currentData()
+        return int(value) if value is not None else None
+
+
+class TimelineList(QListWidget):
+    """按住约 1 秒后才允许拖动，避免和点击选中冲突。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.can_drag = None
+        self.on_drag_blocked = None
+        self._press_pos: Optional[QPoint] = None
+        self._armed = False
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self._arm_drag)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.setDropIndicatorShown(True)
+
+    def mousePressEvent(self, event):
+        self._armed = False
+        self._timer.stop()
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._press_pos = event.position().toPoint()
+            if self.indexAt(self._press_pos).isValid():
+                self._timer.start(1000)
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if not self._armed:
+            if self._press_pos is not None:
+                moved = event.position().toPoint() - self._press_pos
+                if moved.manhattanLength() >= QApplication.startDragDistance():
+                    self._timer.stop()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        self._timer.stop()
+        self._armed = False
+        self._press_pos = None
+        self.unsetCursor()
+        super().mouseReleaseEvent(event)
+
+    def _arm_drag(self):
+        if self.can_drag is not None and not self.can_drag():
+            if self.on_drag_blocked is not None:
+                self.on_drag_blocked()
+            return
+        self._armed = True
+        self.setCursor(Qt.CursorShape.ClosedHandCursor)
+
+    def dropEvent(self, event):
+        super().dropEvent(event)
+        self._armed = False
+        self.unsetCursor()
+
+
 class TimelinePage(QWidget):
+    reordered = pyqtSignal()
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
         self.db = db
@@ -2319,11 +2431,30 @@ class TimelinePage(QWidget):
     def reload(self):
         self._load_summaries()
 
+    def _sync_action_buttons(self):
+        has_route = self.route_id is not None
+        has_item = 0 <= self.list_widget.currentRow() < len(self.summaries)
+        self.btn_add.setEnabled(has_route)
+        self.btn_delete.setEnabled(has_item)
+        self.btn_copy.setEnabled(has_item)
+
+    def _editing(self) -> bool:
+        return not self.detail.isReadOnly()
+
+    def _block_if_editing(self) -> bool:
+        if not self._editing():
+            return False
+        QMessageBox.information(self, "正在编辑", "请先保存或取消当前编辑。")
+        return True
+
     def _init_ui(self):
-        self.list_widget = QListWidget()
+        self.list_widget = TimelineList()
+        self.list_widget.can_drag = lambda: not self._editing()
+        self.list_widget.on_drag_blocked = self._block_if_editing
         self.list_widget.setSpacing(2)
         self.list_widget.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.list_widget.currentRowChanged.connect(self._on_selection_changed)
+        self.list_widget.model().rowsMoved.connect(self._on_summaries_reordered)
 
         self.edit_title = QLineEdit()
         self.edit_title.setObjectName("DetailTitle")
@@ -2351,6 +2482,19 @@ class TimelinePage(QWidget):
         self.btn_cancel_edit.clicked.connect(self._cancel_edit)
         self.btn_cancel_edit.setEnabled(False)
 
+        self.btn_add = QPushButton("新增")
+        set_variant(self.btn_add, "ghost")
+        self.btn_add.setEnabled(False)
+        self.btn_add.clicked.connect(self._add_chapter)
+        self.btn_delete = QPushButton("删除")
+        set_variant(self.btn_delete, "danger")
+        self.btn_delete.setEnabled(False)
+        self.btn_delete.clicked.connect(self._delete_chapter)
+        self.btn_copy = QPushButton("复制到其他线路")
+        set_variant(self.btn_copy, "ghost")
+        self.btn_copy.setEnabled(False)
+        self.btn_copy.clicked.connect(self._copy_to_route)
+
         page = QVBoxLayout(self)
         page.setContentsMargins(16, 14, 16, 14)
         page.setSpacing(12)
@@ -2362,6 +2506,10 @@ class TimelinePage(QWidget):
         left_layout.setContentsMargins(0, 0, 12, 0)
         left_layout.setSpacing(8)
         left_layout.addWidget(make_caption("时间线"))
+        hint = QLabel("按住条目约 1 秒后拖动，可调整顺序")
+        set_cls(hint, "dim")
+        hint.setWordWrap(True)
+        left_layout.addWidget(hint)
         left_layout.addWidget(self.list_widget)
 
         right_widget = QWidget()
@@ -2383,6 +2531,9 @@ class TimelinePage(QWidget):
         detail_btn_layout.addWidget(self.btn_save)
         detail_btn_layout.addWidget(self.btn_cancel_edit)
         detail_btn_layout.addStretch()
+        detail_btn_layout.addWidget(self.btn_add)
+        detail_btn_layout.addWidget(self.btn_delete)
+        detail_btn_layout.addWidget(self.btn_copy)
         right_layout.addLayout(detail_btn_layout)
 
         splitter.addWidget(left_widget)
@@ -2392,7 +2543,8 @@ class TimelinePage(QWidget):
 
         page.addWidget(splitter, 1)
 
-    def _load_summaries(self):
+    def _load_summaries(self, select_id: Optional[int] = None):
+        self._loading_list = True
         self.list_widget.clear()
         self.detail.clear()
         self.detail.setReadOnly(True)
@@ -2405,13 +2557,40 @@ class TimelinePage(QWidget):
         if not self.route_id:
             self.summaries = []
             self.detail.setPlaceholderText("请先在左侧选择游戏与线路")
+            self._loading_list = False
+            self._sync_action_buttons()
             return
         self.detail.setPlaceholderText("点击左侧条目查看完整总结")
         self.summaries = self.db.list_summaries(self.route_id, limit=200)
-        for s in self.summaries:
-            item = QListWidgetItem(self._entry_title(s))
-            item.setData(Qt.ItemDataRole.UserRole, s["id"])
+        chosen = -1
+        for index, summary in enumerate(self.summaries):
+            item = QListWidgetItem(self._entry_title(summary))
+            item.setData(Qt.ItemDataRole.UserRole, summary["id"])
             self.list_widget.addItem(item)
+            if select_id is not None and summary["id"] == select_id:
+                chosen = index
+        if chosen >= 0:
+            self.list_widget.setCurrentRow(chosen)
+        self._loading_list = False
+        self._sync_action_buttons()
+
+    def _on_summaries_reordered(self, *_args):
+        if getattr(self, "_loading_list", False):
+            return
+        ids = []
+        for index in range(self.list_widget.count()):
+            item = self.list_widget.item(index)
+            if item is None:
+                continue
+            summary_id = item.data(Qt.ItemDataRole.UserRole)
+            if summary_id is not None:
+                ids.append(int(summary_id))
+        if not ids:
+            return
+        self.db.set_summary_order(ids)
+        by_id = {summary["id"]: summary for summary in self.summaries}
+        self.summaries = [by_id[summary_id] for summary_id in ids if summary_id in by_id]
+        self.reordered.emit()
 
     @staticmethod
     def _entry_title(s: dict) -> str:
@@ -2438,6 +2617,7 @@ class TimelinePage(QWidget):
             self.detail.clear()
             self.edit_title.clear()
             self.lbl_meta.clear()
+            self._sync_action_buttons()
             return
         s = self.summaries[row]
         self.edit_title.setText(self._entry_title(s))
@@ -2446,6 +2626,7 @@ class TimelinePage(QWidget):
         self.detail.setPlainText(s["content"])
         self._apply_reading_format()
         self.current_summary_id = s["id"]
+        self._sync_action_buttons()
 
     def _toggle_edit_mode(self):
         if self.list_widget.currentRow() < 0:
@@ -2485,6 +2666,71 @@ class TimelinePage(QWidget):
         self.list_widget.item(row).setText(self._entry_title(self.summaries[row]))
         self.edit_title.setText(self._entry_title(self.summaries[row]))
         self._exit_edit_mode()
+
+    def _selected_summary(self) -> Optional[dict]:
+        row = self.list_widget.currentRow()
+        if row < 0 or row >= len(self.summaries):
+            return None
+        return self.summaries[row]
+
+    def _add_chapter(self):
+        if not self.route_id:
+            QMessageBox.information(self, "未选择线路", "请先在左侧选择一条线路。")
+            return
+        if self._block_if_editing():
+            return
+        new_id = self.db.add_manual_chapter(self.route_id, "手动添加待修改", "")
+        self._load_summaries(select_id=new_id)
+
+    def _delete_chapter(self):
+        if self._block_if_editing():
+            return
+        summary = self._selected_summary()
+        if not summary:
+            QMessageBox.information(self, "未选择", "请先选中一段剧情总结。")
+            return
+        reply = QMessageBox.question(self, "确认删除", "确定删除这段剧情总结吗？此操作不可恢复。")
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        row = self.list_widget.currentRow()
+        next_id = None
+        if row + 1 < len(self.summaries):
+            next_id = self.summaries[row + 1]["id"]
+        elif row - 1 >= 0:
+            next_id = self.summaries[row - 1]["id"]
+        self.db.delete_summary(summary["id"])
+        self._load_summaries(select_id=next_id)
+
+    def _copy_to_route(self):
+        if self._block_if_editing():
+            return
+        summary = self._selected_summary()
+        if not summary or not self.route_id:
+            QMessageBox.information(self, "未选择", "请先选中一段剧情总结。")
+            return
+        route = self.db.get_route(self.route_id) or {}
+        game_id = route.get("game_id")
+        if not game_id:
+            QMessageBox.warning(self, "无法复制", "当前线路没有所属游戏。")
+            return
+        targets = [
+            item for item in self.db.list_routes(int(game_id))
+            if item["id"] != self.route_id
+        ]
+        if not targets:
+            QMessageBox.information(self, "没有其他线路", "请先为这个游戏创建另一条线路。")
+            return
+        dialog = CopySummaryDialog(targets, self.window())
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        target_id = dialog.selected_route_id()
+        if not target_id:
+            return
+        title = (summary.get("title") or "").strip()
+        self.db.add_manual_chapter(target_id, title, summary.get("content") or "")
+        target = next((item for item in targets if item["id"] == target_id), None)
+        name = (target or {}).get("name") or "目标线路"
+        QMessageBox.information(self, "已复制", f"已追加到「{name}」。")
 
 
 # ---------------------------------------------------------------------------
@@ -3207,6 +3453,7 @@ class MainWindow(QMainWindow):
         self.frame_texts: list[tuple[int, str]] = []
         self.summary_queue: deque = deque()
         self._summary_task_log: list = []
+        self._summary_task_seq = 0
         self._current_summary_task: Optional[SummaryTask] = None
         self._last_anchor_id = 0
         # 连续完成水位：所有 <= _recognized_upto 的帧都已识别（或已确认丢弃）
@@ -3386,6 +3633,7 @@ class MainWindow(QMainWindow):
 
         self.dashboard_page = self._build_dashboard_page()
         self.timeline_page = TimelinePage(self.db)
+        self.timeline_page.reordered.connect(self._on_timeline_reordered)
         self.keyinfo_page = KeyInfoPage(self.db)
         self.gameroute_page = GameRoutePage(self.db)
         self.gameroute_page.data_changed.connect(self._on_game_data_changed)
@@ -3815,6 +4063,11 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 设置
     # ------------------------------------------------------------------
+    def _on_timeline_reordered(self):
+        if self._summarizing or not self.current_route_id:
+            return
+        self._load_previous_summary()
+
     def _on_settings_saved(self):
         self.llm_client = LLMClient(self.config)
         new_theme = self.config.get("theme", "dark")
@@ -4182,6 +4435,7 @@ class MainWindow(QMainWindow):
             self.frame_texts = []
         self.summary_queue.clear()
         self._summary_task_log = []
+        self._summary_task_seq = 0
         self._current_summary_task = None
         self._last_anchor_id = 0
         self._recognized_upto = 0
@@ -4271,10 +4525,12 @@ class MainWindow(QMainWindow):
             self.toasts.show("没有新画面，无需总结", kind="warn", duration_ms=3000)
             return False
 
+        self._summary_task_seq += 1
         task = SummaryTask(
             anchor_frame_id=anchor,
             start_frame_id=self._last_anchor_id,
             session_id=self._current_session_id or self._last_session_id,
+            queue_seq=self._summary_task_seq,
         )
         self._last_anchor_id = anchor
         self.summary_queue.append(task)
@@ -4664,16 +4920,23 @@ class MainWindow(QMainWindow):
         # 新建
         self.db.add_or_update_character(route_id, name=name, info=info)
 
+    def _summary_insert_at(self, task: SummaryTask) -> Optional[int]:
+        """失败重试时，插到比它更晚、且已经写进库的那段之前。没有更晚的就追加。"""
+        later_ids = [
+            other.summary_id
+            for other in self._summary_task_log
+            if other is not task and other.summary_id and other.queue_seq > task.queue_seq
+        ]
+        if not later_ids:
+            return None
+        return self.db.min_summary_sort_order(later_ids)
+
     def _on_summary_ready(self, summary: str, raw_text: str, key_info_json: str, title: str = ""):
         self._summarizing = False
         self.btn_summarize_main.setEnabled(True)
         self._inflight_summary_text = ""
-        self.previous_summary = summary
-        if self._current_summary_task is not None:
-            self._current_summary_task.state = "已完成"
-            self._current_summary_task.raw_text = ""
-            self._current_summary_task.error = ""
-            self._current_summary_task = None
+        task = self._current_summary_task
+        insert_at = self._summary_insert_at(task) if task is not None else None
 
         # 持久化总结
         summary_id = None
@@ -4691,7 +4954,18 @@ class MainWindow(QMainWindow):
                 summary,
                 raw_text,
                 title=title,
+                insert_at=insert_at,
             )
+            last = self.db.get_last_summary_for_route(self.current_route_id)
+            self.previous_summary = (last or {}).get("content") or summary
+        else:
+            self.previous_summary = summary
+        if task is not None:
+            task.summary_id = summary_id
+            task.state = "已完成"
+            task.raw_text = ""
+            task.error = ""
+            self._current_summary_task = None
 
         # 持久化关键信息
         try:

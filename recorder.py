@@ -82,6 +82,8 @@ class Database:
                     summary_type TEXT NOT NULL,
                     content TEXT NOT NULL,
                     raw_text TEXT DEFAULT '',
+                    title TEXT DEFAULT '',
+                    sort_order INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (route_id) REFERENCES routes(id),
                     FOREIGN KEY (session_id) REFERENCES sessions(id)
@@ -134,6 +136,7 @@ class Database:
             )
             self._migrate_shared_knowledge(conn)
             self._migrate_summary_prompts(conn)
+            self._migrate_summary_order(conn)
             conn.commit()
 
     def _migrate_legacy(self, conn: sqlite3.Connection):
@@ -297,6 +300,46 @@ class Database:
                     now,
                 ),
             )
+
+    def _migrate_summary_order(self, conn: sqlite3.Connection):
+        """旧库补上剧情顺序号，并按原来的时间顺序回填，避免 0 和重号。"""
+        if "sort_order" not in self._table_columns(conn, "summaries"):
+            conn.execute("ALTER TABLE summaries ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 0")
+        route_ids = [
+            row[0] for row in conn.execute("SELECT DISTINCT route_id FROM summaries").fetchall()
+        ]
+        for route_id in route_ids:
+            rows = conn.execute(
+                """
+                SELECT id, COALESCE(sort_order, 0)
+                FROM summaries
+                WHERE route_id=?
+                ORDER BY created_at ASC, id ASC
+                """,
+                (route_id,),
+            ).fetchall()
+            if not rows:
+                continue
+            if all(int(order or 0) <= 0 for _sid, order in rows):
+                for index, (summary_id, _order) in enumerate(rows, start=1):
+                    conn.execute(
+                        "UPDATE summaries SET sort_order=? WHERE id=?",
+                        (index, summary_id),
+                    )
+                continue
+            used = {int(order) for _sid, order in rows if int(order or 0) > 0}
+            next_order = (max(used) + 1) if used else 1
+            for summary_id, order in rows:
+                if int(order or 0) > 0:
+                    continue
+                while next_order in used:
+                    next_order += 1
+                conn.execute(
+                    "UPDATE summaries SET sort_order=? WHERE id=?",
+                    (next_order, summary_id),
+                )
+                used.add(next_order)
+                next_order += 1
 
     # ------------------------------------------------------------------
     # 游戏
@@ -472,20 +515,61 @@ class Database:
         content: str,
         raw_text: str = "",
         title: str = "",
+        created_at: str = "",
+        insert_at: Optional[int] = None,
     ) -> int:
-        now = datetime.datetime.now().isoformat()
+        stamp = (created_at or "").strip() or datetime.datetime.now().isoformat()
         with sqlite3.connect(self.db_path) as conn:
+            if insert_at is None or int(insert_at) <= 0:
+                row = conn.execute(
+                    "SELECT COALESCE(MAX(sort_order), 0) FROM summaries WHERE route_id=?",
+                    (route_id,),
+                ).fetchone()
+                order = int(row[0] or 0) + 1
+            else:
+                order = int(insert_at)
+                # 从大到小加 1，避免中途撞上还没挪开的号
+                shifting = conn.execute(
+                    """
+                    SELECT id FROM summaries
+                    WHERE route_id=? AND sort_order>=?
+                    ORDER BY sort_order DESC, id DESC
+                    """,
+                    (route_id, order),
+                ).fetchall()
+                for (summary_id,) in shifting:
+                    conn.execute(
+                        "UPDATE summaries SET sort_order = sort_order + 1 WHERE id=?",
+                        (summary_id,),
+                    )
             cur = conn.execute(
                 """
-                INSERT INTO summaries (route_id, session_id, summary_type, content, raw_text, title, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO summaries
+                    (route_id, session_id, summary_type, content, raw_text, title, sort_order, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (route_id, session_id, summary_type, content, raw_text, title, now),
+                (route_id, session_id, summary_type, content, raw_text, title, order, stamp),
             )
             summary_id = cur.lastrowid
-            conn.execute("UPDATE routes SET last_summary_id=? WHERE id=?", (summary_id, route_id))
+            self._set_last_summary_id(conn, route_id)
             conn.commit()
             return summary_id
+
+    def _set_last_summary_id(self, conn: sqlite3.Connection, route_id: int):
+        """上一章按剧情顺序取最后一段，不按写入先后。"""
+        last = conn.execute(
+            """
+            SELECT id FROM summaries
+            WHERE route_id=?
+            ORDER BY sort_order DESC, id DESC
+            LIMIT 1
+            """,
+            (route_id,),
+        ).fetchone()
+        conn.execute(
+            "UPDATE routes SET last_summary_id=? WHERE id=?",
+            (last[0] if last else None, route_id),
+        )
 
     def get_summary(self, summary_id: int) -> Optional[Dict[str, Any]]:
         with sqlite3.connect(self.db_path) as conn:
@@ -503,14 +587,60 @@ class Database:
             conn.execute("UPDATE summaries SET title=? WHERE id=?", (title, summary_id))
             conn.commit()
 
+    def add_manual_chapter(self, route_id: int, title: str, content: str = "") -> int:
+        """手动追加一段剧情。不计入游玩时长。线路还没有总结时，这段就是第一章。"""
+        now = datetime.datetime.now().isoformat()
+        with sqlite3.connect(self.db_path) as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO sessions (route_id, start_time, end_time, duration_sec, status)
+                VALUES (?, ?, ?, 0, 'paused')
+                """,
+                (route_id, now, now),
+            )
+            session_id = cur.lastrowid
+            conn.commit()
+        return self.add_summary(route_id, session_id, "manual", content or "", "", title or "")
+
+    def delete_summary(self, summary_id: int):
+        """删除一段剧情总结。共享的线索/角色不删，只解开和这段的关联。"""
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                "SELECT route_id FROM summaries WHERE id=?", (summary_id,)
+            ).fetchone()
+            if not row:
+                return
+            route_id = row[0]
+            conn.execute(
+                "UPDATE key_info SET summary_id=NULL WHERE summary_id=?", (summary_id,)
+            )
+            conn.execute("DELETE FROM summaries WHERE id=?", (summary_id,))
+            self._set_last_summary_id(conn, route_id)
+            conn.commit()
+
     def list_summaries(self, route_id: int, limit: int = 100) -> List[Dict[str, Any]]:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(
-                "SELECT * FROM summaries WHERE route_id=? ORDER BY created_at ASC LIMIT ?",
+                "SELECT * FROM summaries WHERE route_id=? ORDER BY sort_order ASC, id ASC LIMIT ?",
                 (route_id, limit),
             ).fetchall()
             return [dict(row) for row in rows]
+
+    def min_summary_sort_order(self, summary_ids: List[int]) -> Optional[int]:
+        """这些总结里当前最小的顺序号。已被删掉的 id 忽略。"""
+        ids = [int(item) for item in summary_ids if item]
+        if not ids:
+            return None
+        marks = ",".join("?" * len(ids))
+        with sqlite3.connect(self.db_path) as conn:
+            row = conn.execute(
+                f"SELECT MIN(sort_order) FROM summaries WHERE id IN ({marks}) AND sort_order>0",
+                ids,
+            ).fetchone()
+        if not row or row[0] is None:
+            return None
+        return int(row[0])
 
     def search_summaries(self, route_id: int, keyword: str) -> List[Dict[str, Any]]:
         with sqlite3.connect(self.db_path) as conn:
@@ -905,6 +1035,23 @@ class Database:
 
     def set_character_order(self, ids: List[int]):
         self._set_order("characters", ids)
+
+    def set_summary_order(self, ids: List[int]):
+        """按给定顺序重写同一线路的剧情序号，并把最后一段记为上一章。"""
+        if not ids:
+            return
+        with sqlite3.connect(self.db_path) as conn:
+            route_row = conn.execute(
+                "SELECT route_id FROM summaries WHERE id=?", (ids[0],)
+            ).fetchone()
+            for index, item_id in enumerate(ids, start=1):
+                conn.execute(
+                    "UPDATE summaries SET sort_order=? WHERE id=?",
+                    (index, item_id),
+                )
+            if route_row:
+                self._set_last_summary_id(conn, route_row[0])
+            conn.commit()
 
     # ------------------------------------------------------------------
     # 时长统计
