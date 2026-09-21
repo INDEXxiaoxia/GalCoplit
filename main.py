@@ -242,24 +242,20 @@ def _format_dt(iso: str) -> str:
         return str(iso)
 
 
-def export_route_markdown(db: Database, game_id: int, route_id: int, output_dir: str) -> str:
-    """将指定线路的世界观、角色、线索、剧情总结导出为 Markdown 文件，返回文件路径"""
-    game = db.get_game(game_id)
-    route = db.get_route(route_id)
-    if not game or not route:
-        raise ValueError("游戏或线路不存在")
+SUMMARY_LIST_LIMIT = 999
 
-    summaries = db.list_summaries(route_id)
-    characters = db.list_characters(route_id)
-    world_infos = db.list_key_info(route_id, category="世界观设定")
-    clues = db.list_key_info(route_id, category="剧情线索")
 
-    lines: List[str] = []
-    lines.append(f"# {game['name']} - {route['name']}")
-    lines.append("")
-    lines.append(f"- 导出时间：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    lines.append("")
+def _shared_knowledge(db: Database, route_id: Optional[int]):
+    if not route_id:
+        return [], [], []
+    return (
+        db.list_key_info(route_id, category="世界观设定"),
+        db.list_characters(route_id),
+        db.list_key_info(route_id, category="剧情线索"),
+    )
 
+
+def _append_shared_sections(lines: List[str], world_infos, characters, clues):
     lines.append("## 世界观")
     lines.append("")
     lines.append("> 本游戏各线路共享。设定冲突处标为「线路名线中原设定」。")
@@ -305,33 +301,93 @@ def export_route_markdown(db: Database, game_id: int, route_id: int, output_dir:
         lines.append("（暂无线索）")
     lines.append("")
 
+
+def _append_summary_blocks(lines: List[str], summaries, heading: str):
+    if not summaries:
+        lines.append("（暂无剧情总结）")
+        lines.append("")
+        return
+    for summary in summaries:
+        title = summary.get("title") or "段落"
+        created = _format_dt(summary.get("created_at") or "")
+        lines.append(f"{heading} {title}")
+        lines.append(f"<span style=\"color:#888\">{created}</span>")
+        lines.append("")
+        lines.append(summary.get("content", ""))
+        lines.append("")
+
+
+def _write_markdown(output_dir: str, filename: str, lines: List[str]) -> str:
+    path = os.path.join(output_dir, filename)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))
+    return path
+
+
+def export_route_markdown(db: Database, game_id: int, route_id: int, output_dir: str) -> str:
+    """将指定线路的世界观、角色、线索、剧情总结导出为 Markdown 文件，返回文件路径"""
+    game = db.get_game(game_id)
+    route = db.get_route(route_id)
+    if not game or not route:
+        raise ValueError("游戏或线路不存在")
+
+    summaries = db.list_summaries(route_id, limit=SUMMARY_LIST_LIMIT)
+    world_infos, characters, clues = _shared_knowledge(db, route_id)
+
+    lines: List[str] = []
+    lines.append(f"# {game['name']} - {route['name']}")
+    lines.append("")
+    lines.append(f"- 导出时间：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    _append_shared_sections(lines, world_infos, characters, clues)
     lines.append("## 剧情总结")
     lines.append("")
     lines.append("> 仅包含当前线路。")
     lines.append("")
-    if summaries:
-        for s in summaries:
-            title = s.get("title") or "段落"
-            created = _format_dt(s.get("created_at") or "")
-            lines.append(f"### {title}")
-            lines.append(f"<span style=\"color:#888\">{created}</span>")
-            lines.append("")
-            lines.append(s.get("content", ""))
-            lines.append("")
-    else:
-        lines.append("（暂无剧情总结）")
-
-    content = "\n".join(lines)
+    _append_summary_blocks(lines, summaries, "###")
 
     safe_game = _sanitize_filename(game["name"]) or "未命名游戏"
     safe_route = _sanitize_filename(route["name"]) or "未命名线路"
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     filename = f"{safe_game}-{safe_route}-{timestamp}.md"
-    path = os.path.join(output_dir, filename)
+    return _write_markdown(output_dir, filename, lines)
 
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(content)
-    return path
+
+def export_game_markdown(db: Database, game_id: int, output_dir: str) -> tuple:
+    """导出整款游戏。共享设定只写一次，剧情按线路分节。返回 (路径, 达到上限的线路名)。"""
+    game = db.get_game(game_id)
+    if not game:
+        raise ValueError("游戏不存在")
+    routes = db.list_routes(game_id)
+    probe_id = routes[0]["id"] if routes else None
+    world_infos, characters, clues = _shared_knowledge(db, probe_id)
+
+    lines: List[str] = []
+    lines.append(f"# {game['name']}")
+    lines.append("")
+    lines.append(f"- 导出时间：{datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append("")
+    _append_shared_sections(lines, world_infos, characters, clues)
+    lines.append("## 剧情总结")
+    lines.append("")
+    lines.append("> 按线路分开。每条线路最多 999 段，顺序与时间线一致。")
+    lines.append("")
+    capped: List[str] = []
+    if not routes:
+        lines.append("（暂无线路）")
+        lines.append("")
+    for route in routes:
+        lines.append(f"### {route.get('name') or '未命名线路'}")
+        lines.append("")
+        summaries = db.list_summaries(route["id"], limit=SUMMARY_LIST_LIMIT)
+        if len(summaries) >= SUMMARY_LIST_LIMIT:
+            capped.append(route.get("name") or "未命名线路")
+        _append_summary_blocks(lines, summaries, "####")
+
+    safe_game = _sanitize_filename(game["name"]) or "未命名游戏"
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{safe_game}-全部线路-{timestamp}.md"
+    return _write_markdown(output_dir, filename, lines), capped
 
 
 # ---------------------------------------------------------------------------
@@ -1072,6 +1128,44 @@ class TestOCRThread(QThread):
             self.error.emit(str(e))
 
 
+class TestLLMThread(QThread):
+    """用当前填写的地址、密钥和模型发一条很短的请求。"""
+
+    result_ready = pyqtSignal(str)
+    error = pyqtSignal(str)
+
+    def __init__(self, config: dict):
+        super().__init__()
+        self._config = config
+
+    def run(self):
+        try:
+            client = LLMClient(self._config)
+            text = client._chat(
+                [{"role": "user", "content": "请只回复 OK"}],
+                temperature=0,
+                timeout=20,
+            )
+            snippet = (text or "").strip()[:200] or "（模型返回为空）"
+            self.result_ready.emit(snippet)
+        except Exception as e:
+            response = getattr(e, "response", None)
+            status = getattr(response, "status_code", None) if response is not None else None
+            body = ""
+            if response is not None:
+                try:
+                    body = (response.text or "").strip()[:300]
+                except Exception:
+                    body = ""
+            if status:
+                detail = f"HTTP {status}"
+                if body:
+                    detail += f"\n{body}"
+                self.error.emit(detail)
+            else:
+                self.error.emit(str(e) or "连接失败")
+
+
 # ---------------------------------------------------------------------------
 # OCR 区域指示器
 # ---------------------------------------------------------------------------
@@ -1740,7 +1834,15 @@ class SettingsPage(QWidget):
         layout.addRow("界面主题:", self.cmb_theme)
         layout.addRow("OpenAI URL:", self.txt_base_url)
         layout.addRow("API Key:", self.txt_api_key)
-        layout.addRow("模型:", self.txt_model)
+        model_row = QWidget()
+        model_layout = QHBoxLayout(model_row)
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        model_layout.setSpacing(10)
+        model_layout.addWidget(self.txt_model, 1)
+        self.btn_test_llm = QPushButton("测试连接")
+        self.btn_test_llm.clicked.connect(self._test_llm)
+        model_layout.addWidget(self.btn_test_llm)
+        layout.addRow("模型:", model_row)
         layout.addRow("OCR 后端:", self.cmb_ocr_backend)
         self.lbl_ocr_backend_hint = make_hint("")
         layout.addRow(self.lbl_ocr_backend_hint)
@@ -1792,7 +1894,17 @@ class SettingsPage(QWidget):
         ))
         self.chk_save_ocr_text = QCheckBox("保留识别原文")
         self.chk_save_ocr_text.setChecked(bool(self.config.get("save_ocr_text", False)))
-        layout.addRow(self.chk_save_ocr_text)
+        ocr_save_row = QWidget()
+        ocr_save_layout = QHBoxLayout(ocr_save_row)
+        ocr_save_layout.setContentsMargins(0, 0, 0, 0)
+        ocr_save_layout.setSpacing(10)
+        ocr_save_layout.addWidget(self.chk_save_ocr_text)
+        ocr_save_layout.addStretch()
+        btn_open_app_dir = QPushButton("打开软件目录")
+        set_variant(btn_open_app_dir, "ghost")
+        btn_open_app_dir.clicked.connect(self._open_app_dir)
+        ocr_save_layout.addWidget(btn_open_app_dir)
+        layout.addRow(ocr_save_row)
         layout.addRow(make_hint(
             "勾选后，开始识别时在程序所在目录的「-游戏原文保存」里，按「游戏名_线路名.txt」追加每次识别结果。"
             "同一游戏同一线路再次开始识别会继续写入同一文件，不会另建新文件。"
@@ -1969,6 +2081,42 @@ class SettingsPage(QWidget):
         form.setRowVisible(self._row_queue_backlog_hint, enabled)
         form.setRowVisible(self._row_legacy_queue, not enabled)
         form.setRowVisible(self._row_legacy_queue_hint, not enabled)
+
+    def _open_app_dir(self):
+        try:
+            os.startfile(APP_DIR)
+        except Exception as e:
+            QMessageBox.critical(self, "无法打开目录", f"{APP_DIR}\n\n{e}")
+
+    def _test_llm(self):
+        base_url = self.txt_base_url.text().strip()
+        api_key = self.txt_api_key.text().strip()
+        model = self.txt_model.text().strip()
+        if not base_url or not api_key or not model or "您的API地址" in base_url:
+            QMessageBox.information(self, "无法测试", "请先填写 OpenAI URL、API Key 和模型。")
+            return
+        self._save()
+        self.btn_test_llm.setEnabled(False)
+        self.btn_test_llm.setText("测试中…")
+        self._llm_test_thread = TestLLMThread({
+            "base_url": base_url,
+            "api_key": api_key,
+            "model": model,
+        })
+        self._llm_test_thread.result_ready.connect(self._on_llm_test_ok)
+        self._llm_test_thread.error.connect(self._on_llm_test_err)
+        self._llm_test_thread.finished.connect(self._on_llm_test_finished)
+        self._llm_test_thread.start()
+
+    def _on_llm_test_ok(self, text: str):
+        QMessageBox.information(self, "连接成功", f"模型已响应：\n{text}")
+
+    def _on_llm_test_err(self, msg: str):
+        QMessageBox.critical(self, "连接失败", msg or "连接失败")
+
+    def _on_llm_test_finished(self):
+        self.btn_test_llm.setEnabled(True)
+        self.btn_test_llm.setText("测试连接")
 
     def _bind_autosave(self):
         for edit in (self.txt_base_url, self.txt_api_key, self.txt_model, self.txt_tesseract_path):
@@ -2160,7 +2308,11 @@ class GameRoutePage(QWidget):
         route_btns.addWidget(btn_del_route)
         right.addLayout(route_btns)
 
-        btn_export = QPushButton("导出文档")
+        btn_export_game = QPushButton("导出所有章节")
+        btn_export_game.clicked.connect(self._export_game)
+        right.addWidget(btn_export_game)
+
+        btn_export = QPushButton("导出选中章节")
         set_variant(btn_export, "primary")
         btn_export.clicked.connect(self._export_route)
         right.addWidget(btn_export)
@@ -2325,6 +2477,23 @@ class GameRoutePage(QWidget):
             QMessageBox.information(self, "导出成功", f"已导出到：\n{path}")
         except Exception as e:
             QMessageBox.critical(self, "导出失败", f"导出时出错：{e}")
+
+    def _export_game(self):
+        g_row = self.list_games.currentRow()
+        if g_row < 0:
+            QMessageBox.information(self, "未选择游戏", "请先选中一个游戏。")
+            return
+        game = self.games[g_row]
+        try:
+            path, capped = export_game_markdown(self.db, game["id"], APP_DIR)
+        except Exception as e:
+            QMessageBox.critical(self, "导出失败", f"导出时出错：{e}")
+            return
+        message = f"已导出到：\n{path}"
+        if capped:
+            names = "、".join(capped)
+            message += f"\n\n以下线路已达到 999 条上限，更后面的章节未包含：\n{names}"
+        QMessageBox.information(self, "导出成功", message)
 
 
 # ---------------------------------------------------------------------------
@@ -2561,7 +2730,7 @@ class TimelinePage(QWidget):
             self._sync_action_buttons()
             return
         self.detail.setPlaceholderText("点击左侧条目查看完整总结")
-        self.summaries = self.db.list_summaries(self.route_id, limit=200)
+        self.summaries = self.db.list_summaries(self.route_id, limit=999)
         chosen = -1
         for index, summary in enumerate(self.summaries):
             item = QListWidgetItem(self._entry_title(summary))
@@ -3826,6 +3995,25 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.txt_log, "识别日志")
 
         # 队列 tab：总结任务的锚点、帧区间与状态（仅队列模式）
+        self.queue_tab = QWidget()
+        queue_tab_layout = QVBoxLayout(self.queue_tab)
+        queue_tab_layout.setContentsMargins(0, 8, 0, 0)
+        queue_tab_layout.setSpacing(8)
+        self.queue_retry_row = QWidget()
+        retry_row = QHBoxLayout(self.queue_retry_row)
+        retry_row.setContentsMargins(0, 0, 0, 0)
+        retry_row.setSpacing(8)
+        self.lbl_queue_failed = QLabel("0 个总结失败")
+        set_cls(self.lbl_queue_failed, "dim")
+        retry_row.addWidget(self.lbl_queue_failed)
+        retry_row.addStretch()
+        self.btn_retry_failed = QPushButton("批量重试")
+        set_variant(self.btn_retry_failed, "primary")
+        self.btn_retry_failed.clicked.connect(self._retry_all_failed)
+        retry_row.addWidget(self.btn_retry_failed)
+        self.queue_retry_row.setVisible(False)
+        queue_tab_layout.addWidget(self.queue_retry_row)
+
         self.tbl_queue = QTableWidget(0, 5)
         self.tbl_queue.setHorizontalHeaderLabels(["锚点帧", "帧区间", "状态", "入队时间", "操作"])
         self.tbl_queue.verticalHeader().setVisible(False)
@@ -3838,10 +4026,11 @@ class MainWindow(QMainWindow):
             4, QHeaderView.ResizeMode.ResizeToContents
         )
         self.tbl_queue.verticalHeader().setDefaultSectionSize(36)
+        queue_tab_layout.addWidget(self.tbl_queue, 1)
         self._queue_table_sig = None
         self._queue_tab_index = -1
         if self._queue_mode:
-            self._queue_tab_index = self.tabs.addTab(self.tbl_queue, "总结队列")
+            self._queue_tab_index = self.tabs.addTab(self.queue_tab, "总结队列")
 
         mv.addWidget(self.tabs, 1)
 
@@ -4093,7 +4282,7 @@ class MainWindow(QMainWindow):
         self.card_queue.setVisible(new_mode)
         if new_mode:
             if self._queue_tab_index < 0:
-                self._queue_tab_index = self.tabs.addTab(self.tbl_queue, "总结队列")
+                self._queue_tab_index = self.tabs.addTab(self.queue_tab, "总结队列")
         elif self._queue_tab_index >= 0:
             self.tabs.removeTab(self._queue_tab_index)
             self._queue_tab_index = -1
@@ -4713,7 +4902,31 @@ class MainWindow(QMainWindow):
         self.lbl_queue_summary.setText(summary_text)
 
         self.status_window.update_queue_progress(done, total, waiting)
+        failed = [task for task in self._summary_task_log if task.state == "失败"]
+        if hasattr(self, "queue_retry_row"):
+            self.queue_retry_row.setVisible(bool(failed))
+            self.lbl_queue_failed.setText(f"{len(failed)} 个总结失败")
         self._refresh_queue_table()
+
+    def _retry_all_failed(self):
+        failed = [
+            task for task in self._summary_task_log
+            if task.state == "失败" and (task.raw_text or "").strip()
+        ]
+        if not failed:
+            self.toasts.show("没有可重试的失败任务", kind="warn", duration_ms=4000)
+            self._update_queue_ui()
+            return
+        failed.sort(key=lambda task: task.queue_seq)
+        for task in reversed(failed):
+            task.state = "待重试"
+            task.error = ""
+            if not any(item is task for item in self.summary_queue):
+                self.summary_queue.appendleft(task)
+        self.txt_log.append(f"[队列] 批量重试 {len(failed)} 条失败总结")
+        self.toasts.show(f"已重新加入 {len(failed)} 条总结", kind="info")
+        self._pump_summary_queue()
+        self._update_queue_ui()
 
     def _retry_summary_task(self, task: SummaryTask):
         text = (task.raw_text or "").strip()

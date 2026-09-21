@@ -618,7 +618,7 @@ class Database:
             self._set_last_summary_id(conn, route_id)
             conn.commit()
 
-    def list_summaries(self, route_id: int, limit: int = 100) -> List[Dict[str, Any]]:
+    def list_summaries(self, route_id: int, limit: int = 999) -> List[Dict[str, Any]]:
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             rows = conn.execute(

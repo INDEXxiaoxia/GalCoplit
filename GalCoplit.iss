@@ -8,7 +8,7 @@
 ; - 卸载时 Inno 也只删自己装过的文件，同样不会清用户数据
 
 #define MyAppName "GalCoplit"
-#define MyAppVersion "1.2"
+#define MyAppVersion "1.3"
 #define MyAppPublisher "INDEXxiaoxia"
 #define MyAppExeName "GalCoplit.exe"
 #define MyAppURL "https://github.com/INDEXxiaoxia/GalCoplit"
