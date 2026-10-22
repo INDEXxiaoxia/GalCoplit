@@ -1870,8 +1870,8 @@ class Database:
         """新建一条线路，并放上第一块剧情。
 
         选中分支点时，在这个分支上再开一条同级线路。
-        选中某条线路上的剧情时，在这条线路末尾再建一层子分支。
-        没选中，或选中的是主链时，仍在主链末端开分支。
+        选中剧情块时，就在这块后面插入分支。它后面原来的剧情改接到新线路第一段后面。
+        没选中时，仍在主链末端开分支。
         线路名称是第一段标题，备注是第一段正文。
         """
         title = (label or "").strip()
@@ -1885,12 +1885,26 @@ class Database:
             if not nodes:
                 raise StoryTreeError("主链还没有剧情，不能建分支")
             node_map = {node["id"]: node for node in nodes}
-            target = None
+            anchor = None
             if anchor_id:
                 anchor = self._node_by_id(nodes, anchor_id)
                 if not anchor or anchor["tree_id"] != tree_id:
                     raise StoryTreeError("这个段落不在当前剧情树上")
-                target = self._branch_target(anchor, node_map, edges)
+            if anchor and anchor["kind"] == "beat":
+                tail_id = self._detach_successor(conn, anchor, edges)
+                branch_id = self._insert_node(conn, tree_id, "branch", "common")
+                link_kind = self._chain_kind(anchor, edges)
+                order = self._next_edge_order(conn, anchor["id"], link_kind)
+                self._insert_edge(conn, tree_id, anchor["id"], branch_id, link_kind, "", order)
+                beat_id = self._insert_node(conn, tree_id, "beat", "route", title, content or "")
+                edge_order = self._next_edge_order(conn, branch_id, "branch")
+                edge_id = self._insert_edge(conn, tree_id, branch_id, beat_id, "branch", title, edge_order)
+                if tail_id:
+                    self._insert_edge(conn, tree_id, beat_id, tail_id, "branch", "", 1)
+                    self._convert_tail_to_route(conn, tail_id)
+                conn.commit()
+                return {"branch_node_id": branch_id, "edge_id": edge_id, "beat_id": beat_id}
+            target = self._branch_target(anchor, node_map, edges) if anchor else None
             if target is None:
                 target = self._node_by_id(nodes, self._spine_end_id(nodes, edges))
                 if not target:
@@ -2005,15 +2019,20 @@ class Database:
             removed_edge_ids = {edge["id"] for edge in dangling}
             if len(linked) == 1:
                 outgoing = linked[0]
-                if not incoming or incoming["kind"] != outgoing["kind"]:
+                same_kind = bool(incoming and incoming["kind"] == outgoing["kind"])
+                if node["kind"] == "branch" and not same_kind:
+                    removed_edge_ids.add(outgoing["id"])
+                    self._dissolve_branch(conn, node, incoming, outgoing)
+                elif not same_kind:
                     raise StoryTreeError("请先删除后面的剧情")
-                conn.execute(
-                    "UPDATE story_edges SET to_node_id=? WHERE id=?",
-                    (outgoing["to_node_id"], incoming["id"]),
-                )
-                conn.execute("DELETE FROM story_edges WHERE id=?", (outgoing["id"],))
-                conn.execute("DELETE FROM story_edges WHERE from_node_id=?", (node_id,))
-                conn.execute("DELETE FROM story_nodes WHERE id=?", (node_id,))
+                else:
+                    conn.execute(
+                        "UPDATE story_edges SET to_node_id=? WHERE id=?",
+                        (outgoing["to_node_id"], incoming["id"]),
+                    )
+                    conn.execute("DELETE FROM story_edges WHERE id=?", (outgoing["id"],))
+                    conn.execute("DELETE FROM story_edges WHERE from_node_id=?", (node_id,))
+                    conn.execute("DELETE FROM story_nodes WHERE id=?", (node_id,))
             elif incoming and incoming["kind"] == "branch" and node["kind"] == "beat":
                 removed_edge_ids.add(incoming["id"])
                 conn.execute("DELETE FROM story_edges WHERE id=?", (incoming["id"],))
@@ -2297,6 +2316,74 @@ class Database:
             current = nxt
         return current
 
+    def _dissolve_branch(self, conn: sqlite3.Connection, node: Dict[str, Any], incoming, outgoing):
+        """分支点只剩一条线路时，删掉分支点，把这条线路接回上面的剧情。"""
+        child_id = int(outgoing["to_node_id"])
+        if incoming:
+            conn.execute(
+                "UPDATE story_edges SET to_node_id=? WHERE id=?",
+                (child_id, incoming["id"]),
+            )
+            new_kind = incoming["kind"]
+            parent = conn.execute(
+                "SELECT role FROM story_nodes WHERE id=?",
+                (incoming["from_node_id"],),
+            ).fetchone()
+        else:
+            new_kind = "spine"
+            parent = None
+        if outgoing["kind"] != new_kind:
+            if new_kind == "spine":
+                new_role = "common"
+            elif new_kind == "insert":
+                new_role = parent["role"] if parent and parent["role"] in ("append", "variant") else "append"
+            else:
+                new_role = "route"
+            self._fold_chain(conn, child_id, outgoing["kind"], new_kind, new_role)
+        conn.execute("DELETE FROM story_edges WHERE from_node_id=?", (node["id"],))
+        conn.execute("DELETE FROM story_nodes WHERE id=?", (node["id"],))
+
+    def _fold_chain(self, conn: sqlite3.Connection, start_id: int, old_kind: str, new_kind: str, new_role: str):
+        """把一条只剩单线的线路改回上面那条链，碰到下一个真正的分支点就停。"""
+        current = int(start_id)
+        seen = set()
+        while current and current not in seen:
+            seen.add(current)
+            row = conn.execute(
+                "SELECT kind, role FROM story_nodes WHERE id=?",
+                (current,),
+            ).fetchone()
+            if not row or row["kind"] == "branch":
+                return
+            if row["role"] == "route":
+                conn.execute(
+                    "UPDATE story_nodes SET role=? WHERE id=?",
+                    (new_role, current),
+                )
+            cont = conn.execute(
+                """
+                SELECT id, to_node_id FROM story_edges
+                WHERE from_node_id=? AND kind=? AND to_node_id IS NOT NULL
+                ORDER BY sort_order, id
+                """,
+                (current, old_kind),
+            ).fetchall()
+            if len(cont) > 1:
+                raise StoryTreeError("这段后面有多条后续，请先整理")
+            if not cont:
+                return
+            conn.execute(
+                "UPDATE story_edges SET kind=? WHERE id=?",
+                (new_kind, cont[0]["id"]),
+            )
+            nxt = conn.execute(
+                "SELECT kind FROM story_nodes WHERE id=?",
+                (cont[0]["to_node_id"],),
+            ).fetchone()
+            if not nxt or nxt["kind"] == "branch":
+                return
+            current = int(cont[0]["to_node_id"])
+
     def _chain_kind(self, node: Dict[str, Any], edges: List[Dict[str, Any]]) -> str:
         incoming = self._incoming(edges, node["id"])
         if incoming and incoming["kind"] in ("spine", "branch", "insert"):
@@ -2304,6 +2391,60 @@ class Database:
         if node.get("role") == "route":
             return "branch"
         return "spine"
+
+    def _detach_successor(self, conn: sqlite3.Connection, node: Dict[str, Any], edges: List[Dict[str, Any]]) -> Optional[int]:
+        """摘下这块剧情沿当前链的下一段，旁边的追加和差分留在原地。"""
+        kind = self._chain_kind(node, edges)
+        outs = [edge for edge in self._outs(edges, node["id"], kind) if edge.get("to_node_id")]
+        if len(outs) > 1:
+            raise StoryTreeError("这段后面有多条后续，请先整理")
+        if not outs:
+            return None
+        edge = outs[0]
+        tail_id = int(edge["to_node_id"])
+        conn.execute("DELETE FROM story_edges WHERE id=?", (edge["id"],))
+        edges.remove(edge)
+        return tail_id
+
+    def _convert_tail_to_route(self, conn: sqlite3.Connection, start_id: int):
+        """插到新线路第一段后面的旧剧情，改成这条线路的后续。"""
+        current = int(start_id)
+        seen = set()
+        while current and current not in seen:
+            seen.add(current)
+            row = conn.execute(
+                "SELECT kind, role FROM story_nodes WHERE id=?", (current,)
+            ).fetchone()
+            if not row or row["kind"] == "branch":
+                return
+            if row["role"] == "common":
+                conn.execute("UPDATE story_nodes SET role='route' WHERE id=?", (current,))
+            spine = conn.execute(
+                """
+                SELECT id, to_node_id FROM story_edges
+                WHERE from_node_id=? AND kind='spine' AND to_node_id IS NOT NULL
+                ORDER BY sort_order, id
+                """,
+                (current,),
+            ).fetchall()
+            if len(spine) > 1:
+                raise StoryTreeError("这段后面有多条后续，请先整理")
+            if spine:
+                conn.execute("UPDATE story_edges SET kind='branch' WHERE id=?", (spine[0]["id"],))
+                current = int(spine[0]["to_node_id"])
+                continue
+            nxt = conn.execute(
+                """
+                SELECT to_node_id FROM story_edges
+                WHERE from_node_id=? AND kind='branch' AND to_node_id IS NOT NULL
+                ORDER BY sort_order, id
+                """,
+                (current,),
+            ).fetchall()
+            if len(nxt) == 1:
+                current = int(nxt[0]["to_node_id"])
+                continue
+            return
 
     def _branch_target(
         self,

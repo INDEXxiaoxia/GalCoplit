@@ -2,7 +2,7 @@
 
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, pyqtSignal
+from PyQt6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QBrush, QColor, QFont, QPainter, QPainterPath, QPalette, QPen, QPolygonF
 from PyQt6.QtWidgets import (
     QApplication,
@@ -37,6 +37,8 @@ CARD_H = 76
 GAP_X = 64
 GAP_Y = 56
 GAP_CHAIN = 10
+SIDE_BUS_LIFT = 20
+SIDE_BUS_CLEARANCE = SIDE_BUS_LIFT + 12
 
 ROLE_COLOR = {
     "common": "#7AA2F7",
@@ -194,6 +196,7 @@ class StoryCanvas(QGraphicsView):
         self.setScene(QGraphicsScene(self))
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
         self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setViewportUpdateMode(QGraphicsView.ViewportUpdateMode.FullViewportUpdate)
         self.setTransformationAnchor(QGraphicsView.ViewportAnchor.AnchorUnderMouse)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setBackgroundBrush(QBrush(QColor(theme.col("bg"))))
@@ -224,6 +227,7 @@ class StoryCanvas(QGraphicsView):
             scene.setSceneRect(-20, -20, 460, 80)
             self.horizontalScrollBar().setValue(horizontal)
             self.verticalScrollBar().setValue(vertical)
+            self._repaint_soon()
             return
 
         node_map = {node["id"]: node for node in nodes}
@@ -234,6 +238,7 @@ class StoryCanvas(QGraphicsView):
             text.setDefaultTextColor(QColor(theme.col("text_dim")))
             self.horizontalScrollBar().setValue(horizontal)
             self.verticalScrollBar().setValue(vertical)
+            self._repaint_soon()
             return
 
         continued = _continued_ids(nodes, edges)
@@ -256,6 +261,11 @@ class StoryCanvas(QGraphicsView):
         scene.setSceneRect(rect)
         self.horizontalScrollBar().setValue(horizontal)
         self.verticalScrollBar().setValue(vertical)
+        self._repaint_soon()
+
+    def _repaint_soon(self):
+        self.viewport().update()
+        QTimer.singleShot(0, self.viewport().update)
 
     def mousePressEvent(self, event):
         self._press_pos = event.position()
@@ -331,7 +341,7 @@ def _layout_graph(graph: dict):
         positions[node_id] = (x, y)
         depth = _place_sides(node_id, x, y, "spine", edges, node_map, positions)
         nxt = _first_target(edges, node_id, "spine")
-        y += _row_step(depth, tight=False)
+        y += _row_step(depth, tight=False, gap=_gap_before(nxt, "spine", edges, node_map, tight=False))
         node_id = nxt
 
     cursor = graph.get("cursor") or {}
@@ -340,12 +350,26 @@ def _layout_graph(graph: dict):
     return positions, path_ids, cursor_id
 
 
-def _row_step(depth: int, tight: bool) -> float:
-    gap = GAP_CHAIN if tight else GAP_Y
+def _row_step(depth: int, tight: bool, gap: Optional[float] = None) -> float:
+    if gap is None:
+        gap = GAP_CHAIN if tight else GAP_Y
     if depth <= 1:
         return CARD_H + gap
     span = depth * CARD_H + (depth - 1) * GAP_CHAIN
     return span + gap
+
+
+def _gap_before(node_id, chain_kind, edges, node_map, tight: bool) -> float:
+    """下一块自己的追加或差分要从上方绕线时，给这段空隙留出总线的高度。"""
+    base = GAP_CHAIN if tight else GAP_Y
+    if not node_id:
+        return base
+    variants, appends = _side_groups(
+        node_id, edges, node_map, _side_skip(node_id, chain_kind, edges)
+    )
+    if len(variants) >= 2 or len(appends) >= 2:
+        return max(base, SIDE_BUS_CLEARANCE)
+    return base
 
 
 def _place_branch(branch_id, x, y, edges, node_map, positions):
@@ -383,7 +407,7 @@ def _place_chain(start_id, x, y, kind, edges, node_map, positions):
         if nxt_node and nxt_node["kind"] == "branch":
             _place_branch(nxt, x, y + _row_step(depth, tight=False), edges, node_map, positions)
             return
-        y += _row_step(depth, tight=True)
+        y += _row_step(depth, tight=True, gap=_gap_before(nxt, kind, edges, node_map, tight=True))
         node_id = nxt
 
 
@@ -620,12 +644,12 @@ def _draw_side_links(scene, origin, group, positions, path_ids, node_map, left: 
         role = heads[0][3]
         _add_path(
             scene,
-            _edge_path("insert", origin, end, "beat", "beat"),
+            _side_connector(origin, end, left),
             _line_color(heads[0][2], role),
             heads[0][2],
         )
         return
-    bus_y = min(origin[1], *(item[4][1] for item in heads)) - 20
+    bus_y = min(origin[1], *(item[4][1] for item in heads)) - SIDE_BUS_LIFT
     stem_x = origin[0] + (36 if left else CARD_W - 36)
     stem_hot = any(item[2] for item in heads)
     stem_role = next((item[3] for item in heads if item[2]), heads[0][3])
@@ -663,6 +687,25 @@ def _add_path(scene, path: QPainterPath, color: QColor, strong: bool):
     item.setPen(pen)
     item.setZValue(2)
     scene.addItem(item)
+
+
+def _side_connector(origin: tuple, end: tuple, left: bool) -> QPainterPath:
+    """差分从卡片左边接出，追加从右边接出，横线只走两张卡之间的空隙。"""
+    path = QPainterPath()
+    inset = 3
+    if left:
+        x1 = origin[0] + inset
+        x2 = end[0] + CARD_W - inset
+    else:
+        x1 = origin[0] + CARD_W - inset
+        x2 = end[0] + inset
+    y1 = origin[1] + CARD_H / 2
+    y2 = end[1] + CARD_H / 2
+    path.moveTo(x1, y1)
+    path.lineTo(x2, y1)
+    if abs(y1 - y2) >= 1:
+        path.lineTo(x2, y2)
+    return path
 
 
 def _edge_path(kind: str, start: tuple, end: tuple, start_kind: str, end_kind: str) -> QPainterPath:
@@ -1078,13 +1121,7 @@ class StoryTreePage(QWidget):
     def _can_branch_from(self, node: dict) -> bool:
         if node.get("kind") == "branch" or node.get("role") == "route":
             return True
-        if not self._is_spine_common(node):
-            return False
-        outs = [
-            edge for edge in self._graph.get("edges") or []
-            if edge.get("from_node_id") == node["id"] and edge.get("kind") == "spine" and edge.get("to_node_id")
-        ]
-        return not outs
+        return self._is_spine_common(node)
 
     def _open_reader(self, node_id: int):
         self._select_node(node_id)
@@ -1153,12 +1190,29 @@ class StoryTreePage(QWidget):
         self.selected_id = new_id
         self.reload()
 
+    def _has_chain_successor(self, node: dict) -> bool:
+        if node.get("kind") != "beat":
+            return False
+        incoming = self._incoming_edge(node["id"])
+        if not incoming or incoming.get("kind") == "spine":
+            kind = "spine"
+        elif incoming.get("kind") in ("branch", "insert"):
+            kind = incoming["kind"]
+        else:
+            kind = "spine"
+        return any(
+            edge.get("from_node_id") == node["id"] and edge.get("kind") == kind and edge.get("to_node_id")
+            for edge in self._graph.get("edges") or []
+        )
+
     def _branch_prompt(self) -> str:
         node = self._selected()
         if node and node["kind"] == "branch":
             return "在这个分支上再开一条线路："
+        if node and node["kind"] == "beat" and self._has_chain_successor(node):
+            return "从这里插入分支。后面的剧情会接到新线路第一段的后面："
         if node and node.get("role") == "route":
-            return "在这条线路下面新建子分支，填写子线路名称："
+            return "在这里新建子分支，填写子线路名称："
         return "线路名称："
 
     def _add_branch(self):
@@ -1210,7 +1264,11 @@ class StoryTreePage(QWidget):
         if not node:
             return
         title = (node.get("title") or "").strip() or ("分支" if node["kind"] == "branch" else "未命名")
-        reply = QMessageBox.question(self, "确认删除", f"确定删除「{title}」吗？后面还有剧情时需要先删后面的。")
+        if node["kind"] == "branch":
+            prompt = "确定删除这个分支点吗？后面有多条线路时要先删掉；只剩一条时，这条线路会接回上面的剧情。"
+        else:
+            prompt = f"确定删除「{title}」吗？后面还有剧情时需要先删后面的。"
+        reply = QMessageBox.question(self, "确认删除", prompt)
         if reply != QMessageBox.StandardButton.Yes:
             return
         try:

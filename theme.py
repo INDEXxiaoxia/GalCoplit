@@ -153,6 +153,7 @@ QWidget {
 }
 
 QMainWindow { background: transparent; }
+QMainWindow#ConverterWindow, QWidget#ConverterRoot, QSplitter#ConverterSplit { background-color: $bg; }
 QDialog { background-color: $bg; }
 QDialog#GlassDialog { background: transparent; }
 QMessageBox, QInputDialog { background-color: $surface; }
@@ -331,6 +332,7 @@ QLineEdit, QTextEdit, QPlainTextEdit, QSpinBox, QDoubleSpinBox, QComboBox {
 }
 QLineEdit:focus, QTextEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus, QComboBox:focus { border-color: $accent; }
 QTextEdit { padding: 8px; }
+QTextEdit::viewport, QPlainTextEdit::viewport { background-color: $input_bg; border: none; }
 QLineEdit:read-only { color: $text_dim; }
 
 QLineEdit#LiveLine {
@@ -414,12 +416,13 @@ QCheckBox::indicator:hover { border-color: $accent; }
 QCheckBox::indicator:checked { background-color: $accent; border-color: $accent; }
 
 /* ---------- 列表 / 标签页 / 分割条 / 滚动区 ---------- */
-QListWidget {
+QListWidget, QListWidget::viewport {
     background-color: $input_bg;
     border: 1px solid $border;
     border-radius: 10px;
     padding: 6px;
 }
+QListWidget::viewport { border: none; }
 QListWidget::item { padding: 9px 10px; border-radius: 6px; color: $text_dim; margin: 1px 0; }
 QListWidget::item:hover { background-color: $btn_bg; color: $text; }
 QListWidget::item:selected { background-color: $accent_soft; color: $text; }
@@ -454,6 +457,8 @@ QTabBar::tab {
 QTabBar::tab:hover { color: $text_dim; }
 QTabBar::tab:selected { color: $accent; border-bottom: 2px solid $accent; }
 
+QGraphicsView { background-color: $bg; border: none; }
+QGraphicsView::viewport { background-color: $bg; }
 QSplitter::handle { background-color: $border; }
 QSplitter::handle:horizontal { width: 2px; }
 QSplitter::handle:vertical { height: 2px; }
