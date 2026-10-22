@@ -476,6 +476,28 @@ QToolTip {
     background-color: $popup; color: $text;
     border: 1px solid $border; padding: 6px 8px; border-radius: 6px;
 }
+QMenu {
+    background-color: $popup;
+    color: $text;
+    border: 1px solid $win_border;
+    border-radius: 8px;
+    padding: 4px;
+}
+QMenu::item {
+    background-color: transparent;
+    color: $text;
+    padding: 6px 18px;
+    border-radius: 6px;
+}
+QMenu::item:selected {
+    background-color: $accent_soft;
+    color: $text;
+}
+QMenu::separator {
+    height: 1px;
+    background: $border;
+    margin: 4px 8px;
+}
 QMessageBox QPushButton, QInputDialog QPushButton { min-width: 72px; }
 QSizeGrip { background: transparent; width: 14px; height: 14px; }
 """)

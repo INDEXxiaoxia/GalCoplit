@@ -4,6 +4,7 @@
   "model": "your-model-name",
   "ocr_interval_ms": 1000,
   "summary_sentence_count": 100,
+  "plot_context_limit": 12000,
   "ocr_lang": "chi_sim",
   "ocr_backend": "rapid",
   "tesseract_path": "",

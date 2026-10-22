@@ -12,7 +12,7 @@ from typing import Optional, List, Dict, Any
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QLabel, QTextEdit, QMessageBox, QRubberBand, QLineEdit,
-    QDialog, QFormLayout, QSpinBox, QDoubleSpinBox,
+    QDialog, QFileDialog, QFormLayout, QSpinBox, QDoubleSpinBox,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
     QInputDialog, QListWidget, QListWidgetItem, QSplitter, QCheckBox,
     QTabWidget, QFrame, QSizeGrip, QScrollArea, QStackedWidget, QButtonGroup,
@@ -36,7 +36,8 @@ from ocr_engine import (
     DEFAULT_OCR_LANG,
 )
 from llm_client import LLMClient, SUMMARY_PROMPT_BRIEF, SUMMARY_USER_TAIL
-from recorder import Database
+from recorder import Database, StoryTreeError
+from story_tree_page import StoryTreePage
 import theme
 from theme import apply_theme, status_visual, make_shadow
 from framecmp import (
@@ -72,6 +73,7 @@ def _default_config() -> dict:
         "model": "",
         "ocr_interval_ms": 1000,
         "summary_sentence_count": 100,
+        "plot_context_limit": 12000,
         "ocr_lang": "chi_sim",
         "ocr_backend": "rapid",
         "tesseract_path": "",
@@ -115,9 +117,9 @@ PADDLE_INSTALL_DOWNLOAD_HINT = {
 def _normalize_config(config: dict) -> dict:
     """数值/布尔类型归一化 + 非法值兜底。"""
     int_keys = (
-        "ocr_interval_ms", "summary_sentence_count", "det_limit_side_len",
+        "ocr_interval_ms", "summary_sentence_count", "plot_context_limit", "det_limit_side_len",
         "ocr_queue_size", "queue_backlog_limit", "frame_diff_threshold",
-        "last_game_id", "last_route_id",
+        "last_game_id", "last_route_id", "last_tree_id",
     )
     defaults = _default_config()
     for k in int_keys:
@@ -146,6 +148,10 @@ def _normalize_config(config: dict) -> dict:
     if not isinstance(fdt, int) or not 0 <= fdt <= 64:
         fdt = defaults["frame_diff_threshold"]
     config["frame_diff_threshold"] = fdt
+    context_limit = config.get("plot_context_limit", defaults["plot_context_limit"])
+    if not isinstance(context_limit, int) or not 1000 <= context_limit <= 100000:
+        context_limit = defaults["plot_context_limit"]
+    config["plot_context_limit"] = context_limit
     # 文本重复阈值：相似度 0.50..1.00
     try:
         tst = float(config.get("text_similarity_threshold", defaults["text_similarity_threshold"]))
@@ -390,6 +396,21 @@ def export_game_markdown(db: Database, game_id: int, output_dir: str) -> tuple:
     return _write_markdown(output_dir, filename, lines), capped
 
 
+def export_story_tree_markdown(db: Database, tree_id: int, output_dir: str) -> str:
+    """导出一棵剧情树。主链、追加、差分和分支分段书写。"""
+    text = db.render_story_tree_markdown(tree_id)
+    tree = db.get_story_tree(tree_id)
+    game = db.get_game(tree["game_id"]) if tree else None
+    safe_game = _sanitize_filename((game or {}).get("name") or "未命名游戏") or "未命名游戏"
+    safe_tree = _sanitize_filename((tree or {}).get("name") or "剧情树") or "剧情树"
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"{safe_game}-{safe_tree}-{timestamp}.md"
+    path = os.path.join(output_dir, filename)
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(text)
+    return path
+
+
 # ---------------------------------------------------------------------------
 # 通用 UI 小部件
 # ---------------------------------------------------------------------------
@@ -604,6 +625,8 @@ class TitleBar(QWidget):
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton:
+            self._win._title_dragging = True
+            self._win._stable_size = self._win.size()
             self._drag_offset = (
                 event.globalPosition().toPoint() - self._win.frameGeometry().topLeft()
             )
@@ -614,6 +637,8 @@ class TitleBar(QWidget):
 
     def mouseReleaseEvent(self, event):
         self._drag_offset = None
+        self._win._title_dragging = False
+        self._win._stable_size = self._win.size()
 
 
 class BaseDialog(QDialog):
@@ -694,21 +719,91 @@ class BaseDialog(QDialog):
         self._drag_offset = None
 
 
+def _monitor_physical_rects() -> dict:
+    """Windows 显示器设备名到物理像素矩形。Qt 逻辑坐标不能直接乘缩放比。"""
+    if sys.platform != "win32":
+        return {}
+    import ctypes
+    from ctypes import wintypes
+
+    user32 = ctypes.windll.user32
+    rects = {}
+
+    class MONITORINFOEXW(ctypes.Structure):
+        _fields_ = [
+            ("cbSize", wintypes.DWORD),
+            ("rcMonitor", wintypes.RECT),
+            ("rcWork", wintypes.RECT),
+            ("dwFlags", wintypes.DWORD),
+            ("szDevice", wintypes.WCHAR * 32),
+        ]
+
+    enum_proc = ctypes.WINFUNCTYPE(
+        wintypes.BOOL,
+        wintypes.HMONITOR,
+        wintypes.HDC,
+        ctypes.POINTER(wintypes.RECT),
+        wintypes.LPARAM,
+    )
+
+    def callback(monitor, _hdc, _rect, _data):
+        info = MONITORINFOEXW()
+        info.cbSize = ctypes.sizeof(MONITORINFOEXW)
+        if user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            rect = info.rcMonitor
+            rects[info.szDevice] = (rect.left, rect.top, rect.right, rect.bottom)
+        return True
+
+    user32.EnumDisplayMonitors(None, None, enum_proc(callback), 0)
+    return rects
+
+
+def _screen_physical_origin(screen) -> tuple:
+    geo = screen.geometry()
+    dpr = screen.devicePixelRatio() or 1.0
+    if sys.platform != "win32":
+        return geo.x() * dpr, geo.y() * dpr
+    rects = _monitor_physical_rects()
+    name = (screen.name() or "").casefold()
+    for device, rect in rects.items():
+        if device.casefold() == name:
+            return rect[0], rect[1]
+    target_w = round(geo.width() * dpr)
+    target_h = round(geo.height() * dpr)
+    for left, top, right, bottom in rects.values():
+        if abs((right - left) - target_w) <= 2 and abs((bottom - top) - target_h) <= 2:
+            return left, top
+    return geo.x() * dpr, geo.y() * dpr
+
+
 def _logical_bbox_to_physical(region: dict) -> tuple:
-    """将 Qt 逻辑坐标转换为 PIL 截图所需的物理像素坐标（处理高分屏缩放）"""
-    left = region["left"]
-    top = region["top"]
-    right = left + region["width"]
-    bottom = top + region["height"]
-    screen = QGuiApplication.screenAt(QPoint(left, top))
-    if screen:
-        dpr = screen.devicePixelRatio()
-        if dpr and dpr != 1.0:
-            left = int(left * dpr)
-            top = int(top * dpr)
-            right = int(right * dpr)
-            bottom = int(bottom * dpr)
-    return left, top, right, bottom
+    """把 Qt 全局逻辑坐标换成虚拟桌面上的物理像素，副屏和不同缩放都能对上。"""
+    left = int(region["left"])
+    top = int(region["top"])
+    width = max(1, int(region["width"]))
+    height = max(1, int(region["height"]))
+    point = QPoint(left + width // 2, top + height // 2)
+    screen = QGuiApplication.screenAt(point) or QGuiApplication.screenAt(QPoint(left, top))
+    if screen is None:
+        screen = QGuiApplication.primaryScreen()
+    if screen is None:
+        return left, top, left + width, top + height
+    origin_x, origin_y = _screen_physical_origin(screen)
+    geo = screen.geometry()
+    dpr = screen.devicePixelRatio() or 1.0
+    physical_left = int(round(origin_x + (left - geo.x()) * dpr))
+    physical_top = int(round(origin_y + (top - geo.y()) * dpr))
+    physical_right = physical_left + max(1, int(round(width * dpr)))
+    physical_bottom = physical_top + max(1, int(round(height * dpr)))
+    return physical_left, physical_top, physical_right, physical_bottom
+
+
+def _grab_region(bbox: tuple):
+    """截取虚拟桌面上的一块。all_screens 才能截到主屏以外的显示器。"""
+    try:
+        return ImageGrab.grab(bbox=bbox, all_screens=True)
+    except TypeError:
+        return ImageGrab.grab(bbox=bbox)
 
 
 # ---------------------------------------------------------------------------
@@ -802,7 +897,7 @@ class OCRWorker(QThread):
             try:
                 with self._bbox_lock:
                     bbox = self._physical_bbox
-                pil_img = ImageGrab.grab(bbox=bbox)
+                pil_img = _grab_region(bbox)
                 h = frame_hash(pil_img)
                 if not have_hash or hamming_distance(h, last_hash) > self.frame_diff_threshold:
                     last_hash = h
@@ -937,7 +1032,7 @@ class QueuedOCRWorker(QThread):
             try:
                 with self._bbox_lock:
                     bbox = self._physical_bbox
-                pil_img = ImageGrab.grab(bbox=bbox)
+                pil_img = _grab_region(bbox)
                 h = frame_hash(pil_img)
                 if not have_hash or hamming_distance(h, last_hash) > self.frame_diff_threshold:
                     last_hash = h
@@ -1027,6 +1122,7 @@ class SummaryTask:
     error: str = ""
     queue_seq: int = 0
     summary_id: Optional[int] = None
+    node_id: Optional[int] = None
 
 
 class SummaryThread(QThread):
@@ -1114,7 +1210,7 @@ class TestOCRThread(QThread):
         try:
             set_tesseract_cmd(self.tesseract_path)
             bbox = _logical_bbox_to_physical(self.region)
-            pil_img = ImageGrab.grab(bbox=bbox)
+            pil_img = _grab_region(bbox)
             start = time.monotonic()
             text, conf = ocr_image_extended(pil_img, self.lang, backend=self.backend, det_limit=self.det_limit)
             elapsed_ms = int((time.monotonic() - start) * 1000)
@@ -1382,6 +1478,7 @@ class StatusWindow(QWidget):
         self._ocr_running = False
         self._queue_mode = False
         self._manual_mode = False
+        self._summarize_gate = None
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(2, 2, 2, 2)
@@ -1487,10 +1584,15 @@ class StatusWindow(QWidget):
         color, blink = status_visual(summary_status)
         self.dot_summary.set_state(color, blink)
         # 总结中时禁用总结按钮；队列模式下可继续追加锚点任务，故保持可用
+        allowed = True if self._summarize_gate is None else bool(self._summarize_gate())
         if summary_status == "总结中" and not self._queue_mode:
             self.btn_summarize.setEnabled(False)
         else:
-            self.btn_summarize.setEnabled(True)
+            self.btn_summarize.setEnabled(allowed)
+
+    def set_summarize_gate(self, gate):
+        """gate() 为假时，浮窗上的总结按钮不可用。"""
+        self._summarize_gate = gate
 
     def set_ocr_running(self, running: bool):
         """显式同步 OCR 运行状态，控制暂停/继续按钮图标"""
@@ -1809,6 +1911,12 @@ class SettingsPage(QWidget):
         self.spin_summary_count.setSuffix(" 句")
         self.spin_summary_count.setValue(self.config.get("summary_sentence_count", 50))
 
+        self.spin_plot_context = NoWheelSpinBox()
+        self.spin_plot_context.setRange(1000, 100000)
+        self.spin_plot_context.setSingleStep(1000)
+        self.spin_plot_context.setSuffix(" 字")
+        self.spin_plot_context.setValue(self.config.get("plot_context_limit", 12000))
+
         self.cmb_ocr_backend = make_combo()
         current_backend = normalize_backend(self.config.get("ocr_backend", "rapid"))
         for backend_id, label in OCR_BACKEND_OPTIONS:
@@ -1906,8 +2014,8 @@ class SettingsPage(QWidget):
         ocr_save_layout.addWidget(btn_open_app_dir)
         layout.addRow(ocr_save_row)
         layout.addRow(make_hint(
-            "勾选后，开始识别时在程序所在目录的「-游戏原文保存」里，按「游戏名_线路名.txt」追加每次识别结果。"
-            "同一游戏同一线路再次开始识别会继续写入同一文件，不会另建新文件。"
+            "勾选后，开始识别时在程序所在目录的「-游戏原文保存」里，按「游戏名_剧情树名.txt」追加每次识别结果。"
+            "同一游戏同一剧情树再次开始识别会继续写入同一文件，不会另建新文件。"
         ))
         layout.addRow(self.chk_queue_mode)
 
@@ -1937,6 +2045,11 @@ class SettingsPage(QWidget):
         summary_count_form.setContentsMargins(0, 0, 0, 0)
         summary_count_form.addRow("总结句数:", self.spin_summary_count)
         layout.addRow(self.summary_count_container)
+        layout.addRow("剧情上下文上限:", self.spin_plot_context)
+        layout.addRow(make_hint(
+            "总结时带上当前链路里已经写好的剧情，超过该字数就从最早的段落裁掉。"
+            "不包括这次要总结的识别原文。默认 12000 字。"
+        ))
 
         layout.addRow(self.chk_auto_key_info)
 
@@ -2128,6 +2241,7 @@ class SettingsPage(QWidget):
             self.spin_queue_backlog,
             self.spin_frame_diff,
             self.spin_summary_count,
+            self.spin_plot_context,
         ):
             spin.valueChanged.connect(self._save)
         self.spin_text_sim.valueChanged.connect(self._save)
@@ -2177,6 +2291,7 @@ class SettingsPage(QWidget):
             "frame_diff_threshold": self.spin_frame_diff.value(),
             "text_similarity_threshold": round(self.spin_text_sim.value(), 2),
             "summary_sentence_count": self.spin_summary_count.value(),
+            "plot_context_limit": self.spin_plot_context.value(),
             "ocr_backend": backend,
             "summary_mode": self.cmb_summary_mode.currentText(),
             "auto_extract_key_info": self.chk_auto_key_info.isChecked(),
@@ -2231,12 +2346,13 @@ class GamePromptDialog(BaseDialog):
 
 class GameRoutePage(QWidget):
     data_changed = pyqtSignal()          # 任意增删改后发出，用于刷新侧边栏下拉框
-    route_chosen = pyqtSignal(int, int)  # (game_id, route_id) 设为当前线路
+    tree_chosen = pyqtSignal(int, int)   # (game_id, tree_id) 设为当前剧情树
 
     def __init__(self, db: Database, parent=None):
         super().__init__(parent)
         self.db = db
         self.current_game_id: Optional[int] = None
+        self.trees: List[dict] = []
         self._init_ui()
         self._load_games()
 
@@ -2250,7 +2366,7 @@ class GameRoutePage(QWidget):
         page = QVBoxLayout(self)
         page.setContentsMargins(16, 14, 16, 14)
         page.setSpacing(12)
-        page.addWidget(make_caption("游戏 / 线路管理 · MANAGE"))
+        page.addWidget(make_caption("游戏 / 剧情树 · MANAGE"))
 
         layout = QHBoxLayout()
         layout.setSpacing(16)
@@ -2283,44 +2399,83 @@ class GameRoutePage(QWidget):
         game_btns.addWidget(btn_prompt)
         game_btns.addWidget(btn_del_game)
         left.addLayout(game_btns)
+        io_btns = QHBoxLayout()
+        io_btns.setSpacing(6)
+        btn_export_data = QPushButton("导出数据")
+        btn_export_data.clicked.connect(self._export_bundle)
+        btn_import_data = QPushButton("导入游戏")
+        btn_import_data.clicked.connect(self._import_bundle)
+        io_btns.addWidget(btn_export_data)
+        io_btns.addWidget(btn_import_data)
+        left.addLayout(io_btns)
 
-        # 线路列表
+        # 剧情树与旧线路
         right = QVBoxLayout()
         right.setSpacing(8)
-        right.addWidget(make_caption("线路 · ROUTES"))
+        self.manage_tabs = QTabWidget()
+        right.addWidget(self.manage_tabs, 1)
+
+        tree_tab = QWidget()
+        tree_layout = QVBoxLayout(tree_tab)
+        tree_layout.setContentsMargins(0, 8, 0, 0)
+        tree_layout.setSpacing(8)
+        tree_layout.addWidget(make_caption("剧情树 · TREES"))
+        self.list_trees = QListWidget()
+        tree_layout.addWidget(self.list_trees, 1)
+        tree_btns = QHBoxLayout()
+        tree_btns.setSpacing(6)
+        btn_add_tree = QPushButton("新建")
+        btn_add_tree.clicked.connect(self._add_tree)
+        btn_rename_tree = QPushButton("重命名")
+        btn_rename_tree.clicked.connect(self._rename_tree)
+        btn_tree_prompt = QPushButton("提示词")
+        btn_tree_prompt.clicked.connect(self._edit_tree_prompt)
+        btn_del_tree = QPushButton("删除")
+        set_variant(btn_del_tree, "danger")
+        btn_del_tree.clicked.connect(self._delete_tree)
+        tree_btns.addWidget(btn_add_tree)
+        tree_btns.addWidget(btn_rename_tree)
+        tree_btns.addWidget(btn_tree_prompt)
+        tree_btns.addWidget(btn_del_tree)
+        tree_layout.addLayout(tree_btns)
+        btn_export_tree = QPushButton("导出这棵剧情树")
+        set_variant(btn_export_tree, "primary")
+        btn_export_tree.clicked.connect(self._export_tree)
+        tree_layout.addWidget(btn_export_tree)
+        btn_select_tree = QPushButton("✓  设为当前剧情树")
+        set_variant(btn_select_tree, "primary")
+        btn_select_tree.clicked.connect(self._choose_tree)
+        tree_layout.addWidget(btn_select_tree)
+        self.manage_tabs.addTab(tree_tab, "剧情树")
+
+        route_tab = QWidget()
+        route_layout = QVBoxLayout(route_tab)
+        route_layout.setContentsMargins(0, 8, 0, 0)
+        route_layout.setSpacing(8)
+        route_layout.addWidget(make_caption("旧线路 · ROUTES"))
+        route_layout.addWidget(make_hint("这里是改版前的线路存档，只供查看和导出。新的总结写在剧情树上。"))
         self.list_routes = QListWidget()
         self.list_routes.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.list_routes.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.list_routes.model().rowsMoved.connect(self._on_routes_reordered)
-        right.addWidget(self.list_routes, 1)
-
+        route_layout.addWidget(self.list_routes, 1)
         route_btns = QHBoxLayout()
         route_btns.setSpacing(6)
-        btn_add_route = QPushButton("新建")
-        btn_add_route.clicked.connect(self._add_route)
         btn_rename_route = QPushButton("重命名")
         btn_rename_route.clicked.connect(self._rename_route)
         btn_del_route = QPushButton("删除")
         set_variant(btn_del_route, "danger")
         btn_del_route.clicked.connect(self._delete_route)
-        route_btns.addWidget(btn_add_route)
         route_btns.addWidget(btn_rename_route)
         route_btns.addWidget(btn_del_route)
-        right.addLayout(route_btns)
-
-        btn_export_game = QPushButton("导出所有章节")
+        route_layout.addLayout(route_btns)
+        btn_export_game = QPushButton("导出所有旧线路")
         btn_export_game.clicked.connect(self._export_game)
-        right.addWidget(btn_export_game)
-
-        btn_export = QPushButton("导出选中章节")
-        set_variant(btn_export, "primary")
+        route_layout.addWidget(btn_export_game)
+        btn_export = QPushButton("导出选中旧线路")
         btn_export.clicked.connect(self._export_route)
-        right.addWidget(btn_export)
-
-        btn_select = QPushButton("✓  设为当前线路")
-        set_variant(btn_select, "primary")
-        btn_select.clicked.connect(self._choose_route)
-        right.addWidget(btn_select)
+        route_layout.addWidget(btn_export)
+        self.manage_tabs.addTab(route_tab, "旧线路")
 
         layout.addLayout(left, 1)
         layout.addLayout(right, 1)
@@ -2344,7 +2499,9 @@ class GameRoutePage(QWidget):
 
     def _on_game_changed(self):
         self.list_routes.clear()
+        self.list_trees.clear()
         self.routes = []
+        self.trees = []
         row = self.list_games.currentRow()
         if row < 0 or row >= len(self.games):
             return
@@ -2354,6 +2511,11 @@ class GameRoutePage(QWidget):
             item = QListWidgetItem(route["name"])
             item.setData(Qt.ItemDataRole.UserRole, route["id"])
             self.list_routes.addItem(item)
+        self.trees = self.db.list_story_trees(game_id)
+        for tree in self.trees:
+            item = QListWidgetItem(tree["name"])
+            item.setData(Qt.ItemDataRole.UserRole, tree["id"])
+            self.list_trees.addItem(item)
 
     def _on_game_double_clicked(self, item):
         self._on_game_changed()
@@ -2384,10 +2546,87 @@ class GameRoutePage(QWidget):
         name, ok = QInputDialog.getText(self, "新建游戏", "游戏名称：")
         if ok and name.strip():
             game_id = self.db.add_game(name.strip())
-            self.db.add_route(game_id, "默认线路")
+            try:
+                self.db.add_story_tree(game_id, "本篇")
+            except StoryTreeError as exc:
+                QMessageBox.warning(self, "未能创建剧情树", str(exc))
             self.current_game_id = game_id
             self._load_games()
             self.data_changed.emit()
+
+    def _add_tree(self):
+        row = self.list_games.currentRow()
+        if row < 0:
+            QMessageBox.warning(self, "未选择游戏", "请先选择一个游戏。")
+            return
+        name, ok = QInputDialog.getText(self, "新建剧情树", "名称（例如：本篇、外传）：")
+        if not ok or not name.strip():
+            return
+        try:
+            self.db.add_story_tree(self.games[row]["id"], name.strip())
+        except StoryTreeError as exc:
+            QMessageBox.warning(self, "未能创建剧情树", str(exc))
+            return
+        self._on_game_changed()
+        self.data_changed.emit()
+
+    def _rename_tree(self):
+        row = self.list_trees.currentRow()
+        if row < 0 or row >= len(self.trees):
+            return
+        tree = self.trees[row]
+        name, ok = QInputDialog.getText(self, "重命名剧情树", "名称：", text=tree["name"])
+        if not ok or not name.strip():
+            return
+        try:
+            self.db.rename_story_tree(tree["id"], name.strip())
+        except StoryTreeError as exc:
+            QMessageBox.warning(self, "未能重命名", str(exc))
+            return
+        self._on_game_changed()
+        self.data_changed.emit()
+
+    def _delete_tree(self):
+        row = self.list_trees.currentRow()
+        if row < 0 or row >= len(self.trees):
+            return
+        tree = self.trees[row]
+        reply = QMessageBox.question(self, "确认删除", f"确定删除剧情树《{tree['name']}》吗？树上的剧情会一起删除。")
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.db.delete_story_tree(tree["id"])
+        self._on_game_changed()
+        self.data_changed.emit()
+
+    def _edit_tree_prompt(self):
+        row = self.list_trees.currentRow()
+        if row < 0 or row >= len(self.trees):
+            return
+        tree = self.trees[row]
+        dialog = GamePromptDialog(tree["name"], tree.get("prompt") or "", parent=self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.db.update_story_tree_prompt(tree["id"], dialog.prompt)
+            self._on_game_changed()
+            self.data_changed.emit()
+
+    def _choose_tree(self):
+        g_row = self.list_games.currentRow()
+        t_row = self.list_trees.currentRow()
+        if g_row < 0 or t_row < 0 or t_row >= len(self.trees):
+            QMessageBox.information(self, "未选择剧情树", "请先选中一个游戏和一棵剧情树。")
+            return
+        self.tree_chosen.emit(self.games[g_row]["id"], self.trees[t_row]["id"])
+
+    def _export_tree(self):
+        t_row = self.list_trees.currentRow()
+        if t_row < 0 or t_row >= len(getattr(self, "trees", [])):
+            QMessageBox.information(self, "未选择剧情树", "请先选中一棵剧情树。")
+            return
+        try:
+            path = export_story_tree_markdown(self.db, self.trees[t_row]["id"], APP_DIR)
+            QMessageBox.information(self, "导出成功", f"已导出到：\n{path}")
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", f"导出时出错：{exc}")
 
     def _rename_game(self):
         row = self.list_games.currentRow()
@@ -2405,7 +2644,7 @@ class GameRoutePage(QWidget):
         if row < 0:
             return
         game = self.games[row]
-        reply = QMessageBox.question(self, "确认删除", f"确定删除游戏《{game['name']}》及其所有线路和记录吗？")
+        reply = QMessageBox.question(self, "确认删除", f"确定删除游戏《{game['name']}》及其剧情树、旧线路和记录吗？")
         if reply == QMessageBox.StandardButton.Yes:
             self.db.delete_game(game["id"])
             self._load_games()
@@ -2420,18 +2659,6 @@ class GameRoutePage(QWidget):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.db.update_game_prompt(game["id"], dialog.prompt)
             game["prompt"] = dialog.prompt
-            self.data_changed.emit()
-
-    def _add_route(self):
-        row = self.list_games.currentRow()
-        if row < 0:
-            QMessageBox.warning(self, "未选择游戏", "请先选择一个游戏。")
-            return
-        game_id = self.games[row]["id"]
-        name, ok = QInputDialog.getText(self, "新建线路", "线路名称：")
-        if ok and name.strip():
-            self.db.add_route(game_id, name.strip())
-            self._on_game_changed()
             self.data_changed.emit()
 
     def _rename_route(self):
@@ -2455,14 +2682,6 @@ class GameRoutePage(QWidget):
             self.db.delete_route(route["id"])
             self._on_game_changed()
             self.data_changed.emit()
-
-    def _choose_route(self):
-        g_row = self.list_games.currentRow()
-        r_row = self.list_routes.currentRow()
-        if g_row < 0 or r_row < 0:
-            QMessageBox.information(self, "未选择线路", "请先选中一个游戏和一条线路。")
-            return
-        self.route_chosen.emit(self.games[g_row]["id"], self.routes[r_row]["id"])
 
     def _export_route(self):
         g_row = self.list_games.currentRow()
@@ -2494,6 +2713,57 @@ class GameRoutePage(QWidget):
             names = "、".join(capped)
             message += f"\n\n以下线路已达到 999 条上限，更后面的章节未包含：\n{names}"
         QMessageBox.information(self, "导出成功", message)
+
+    def _export_bundle(self):
+        g_row = self.list_games.currentRow()
+        if g_row < 0:
+            QMessageBox.information(self, "未选择游戏", "请先选中一个游戏。")
+            return
+        game = self.games[g_row]
+        safe = "".join(ch for ch in (game.get("name") or "") if ch not in '\\/:*?"<>|').strip() or "游戏"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出游戏数据",
+            os.path.join(APP_DIR, f"{safe}.galcoplit.json"),
+            "GalCoplit 游戏数据 (*.galcoplit.json)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".galcoplit.json"):
+            path += ".galcoplit.json"
+        try:
+            data = self.db.export_game_bundle(game["id"])
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            QMessageBox.critical(self, "导出失败", f"导出时出错：{exc}")
+            return
+        QMessageBox.information(
+            self,
+            "导出成功",
+            f"已导出到：\n{path}\n\n这份数据可以在另一台电脑上用「导入游戏」打开。Markdown 导出仍然保留。",
+        )
+
+    def _import_bundle(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "导入游戏",
+            APP_DIR,
+            "GalCoplit 游戏数据 (*.galcoplit.json);;JSON (*.json)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            created = self.db.import_game_bundle(data)
+        except Exception as exc:
+            QMessageBox.critical(self, "导入失败", str(exc))
+            return
+        self.current_game_id = created["id"]
+        self.reload()
+        self.data_changed.emit()
+        QMessageBox.information(self, "导入成功", f"已导入游戏《{created['name']}》。")
 
 
 # ---------------------------------------------------------------------------
@@ -3150,8 +3420,8 @@ class KeyInfoPage(QWidget):
         page.setSpacing(12)
         page.addWidget(make_caption("关键信息 · KEY INFO"))
         page.addWidget(make_hint(
-            "剧情线索、世界观、角色在同一游戏的各线路间共享。"
-            "不同线路出现设定冲突时，会标成「线路名线中原设定」。剧情总结仍按线路分开。"
+            "剧情线索、世界观、角色在同一游戏的各剧情树之间共享。"
+            "设定冲突时标成「线路名线中原设定」。"
         ))
 
         self.tabs = QTabWidget()
@@ -3589,6 +3859,9 @@ class MainWindow(QMainWindow):
             | Qt.WindowType.FramelessWindowHint
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self._title_dragging = False
+        self._stable_size = None
+        self._fixing_size = False
         self.config = self._load_config()
         self.llm_client = LLMClient(self.config)
         try:
@@ -3600,6 +3873,7 @@ class MainWindow(QMainWindow):
         self.status_window = StatusWindow()
         self.status_window.summarize_requested.connect(self._manual_summarize)
         self.status_window.toggle_pause_requested.connect(self._toggle_ocr)
+        self.status_window.set_summarize_gate(lambda: self._summarize_allowed())
         self.region_indicator = RegionIndicator()
         self.region_indicator.region_changed.connect(self._on_region_indicator_changed)
 
@@ -3635,7 +3909,7 @@ class MainWindow(QMainWindow):
         self._frame_seq_base = 0
         self._draining = False
         self._draining_workers: list = []
-        self._queue_route_id: Optional[int] = None
+        self._queue_tree_id: Optional[int] = None
         self._queue_timer = QTimer(self)
         self._queue_timer.setInterval(500)
         self._queue_timer.timeout.connect(self._on_queue_tick)
@@ -3644,7 +3918,8 @@ class MainWindow(QMainWindow):
         self._ocr_transcript_logged = False
 
         self.current_game_id: Optional[int] = self.config.get("last_game_id")
-        self.current_route_id: Optional[int] = self.config.get("last_route_id")
+        self.current_tree_id: Optional[int] = self.config.get("last_tree_id")
+        self.current_route_id: Optional[int] = None
 
         self.session_start: Optional[datetime.datetime] = None
 
@@ -3777,7 +4052,7 @@ class MainWindow(QMainWindow):
         self.nav_group = QButtonGroup(self)
         self.nav_group.setExclusive(True)
         for idx, (glyph, text) in enumerate(
-            [("▣", "主界面"), ("≡", "剧情总结"), ("✦", "关键信息"), ("▤", "游戏管理"), ("✎", "提示词配置"), ("⚙", "设置")]
+            [("▣", "主界面"), ("≡", "剧情树"), ("✦", "关键信息"), ("▤", "游戏管理"), ("✎", "提示词配置"), ("⚙", "设置")]
         ):
             btn = NavButton(glyph, text)
             self.nav_group.addButton(btn, idx)
@@ -3801,17 +4076,17 @@ class MainWindow(QMainWindow):
         body.addWidget(self.stack, 1)
 
         self.dashboard_page = self._build_dashboard_page()
-        self.timeline_page = TimelinePage(self.db)
-        self.timeline_page.reordered.connect(self._on_timeline_reordered)
+        self.story_page = StoryTreePage(self.db)
+        self.story_page.cursor_changed.connect(self._on_story_cursor_changed)
         self.keyinfo_page = KeyInfoPage(self.db)
         self.gameroute_page = GameRoutePage(self.db)
         self.gameroute_page.data_changed.connect(self._on_game_data_changed)
-        self.gameroute_page.route_chosen.connect(self._on_route_chosen)
+        self.gameroute_page.tree_chosen.connect(self._on_tree_chosen)
         self.prompt_page = PromptConfigPage(self.db)
         self.settings_page = SettingsPage(self.config)
         self.settings_page.saved.connect(self._on_settings_saved)
         self.stack.addWidget(self.dashboard_page)
-        self.stack.addWidget(self.timeline_page)
+        self.stack.addWidget(self.story_page)
         self.stack.addWidget(self.keyinfo_page)
         self.stack.addWidget(self.gameroute_page)
         self.stack.addWidget(self.prompt_page)
@@ -4041,7 +4316,7 @@ class MainWindow(QMainWindow):
     def _switch_page(self, index: int):
         self.stack.setCurrentIndex(index)
         if index == 1:
-            self.timeline_page.reload()
+            self.story_page.reload()
         elif index == 2:
             self.keyinfo_page.reload()
         elif index == 3:
@@ -4077,59 +4352,62 @@ class MainWindow(QMainWindow):
             self.cmb_game.setCurrentIndex(idx)
         self.cmb_game.blockSignals(False)
 
-    def _populate_route_combo(self, game_id: Optional[int], select_route_id: Optional[int] = None):
+    def _populate_tree_combo(self, game_id: Optional[int], select_tree_id: Optional[int] = None):
         self.cmb_route.blockSignals(True)
         self.cmb_route.clear()
-        routes = self.db.list_routes(game_id) if game_id else []
-        for route in routes:
-            self.cmb_route.addItem(route["name"], route["id"])
-        if routes:
-            idx = next(
-                (i for i, r in enumerate(routes) if r["id"] == select_route_id), 0
-            )
+        trees = self.db.list_story_trees(game_id) if game_id else []
+        for tree in trees:
+            self.cmb_route.addItem(tree["name"], tree["id"])
+        if trees:
+            idx = next((i for i, tree in enumerate(trees) if tree["id"] == select_tree_id), 0)
             self.cmb_route.setCurrentIndex(idx)
         self.cmb_route.blockSignals(False)
 
     def _restore_current_route(self):
-        """启动时恢复上次选择，不存在则回退到第一项"""
+        """启动时恢复上次的游戏和剧情树。"""
         game_id = self.current_game_id
         if not (game_id and self.db.get_game(game_id)):
             game_id = None
         self._populate_game_combo(game_id)
 
-        route_id = self.current_route_id
-        route = self.db.get_route(route_id) if route_id else None
-        if not route or route["game_id"] != self.cmb_game.currentData():
-            route_id = None
-        self._populate_route_combo(self.cmb_game.currentData(), route_id)
-
+        tree_id = self.current_tree_id
+        tree = self.db.get_story_tree(tree_id) if tree_id else None
+        if not tree or tree["game_id"] != self.cmb_game.currentData():
+            tree_id = None
+        self._populate_tree_combo(self.cmb_game.currentData(), tree_id)
         self._commit_route_selection(initial=True)
 
     def _ensure_game_route(self) -> bool:
-        """确保至少有一个游戏和线路，没有则自动创建默认"""
+        """没有游戏时创建默认游戏和本篇树。已有游戏但没有剧情树时请用户自己新建。"""
         try:
             games = self.db.list_games()
             if not games:
                 game_id = self.db.add_game("默认游戏", notes="")
-                route_id = self.db.add_route(game_id, "默认线路", notes="")
+                tree_id = self.db.add_story_tree(game_id, "本篇")
                 self.current_game_id = game_id
-                self.current_route_id = route_id
+                self.current_tree_id = tree_id
                 self._populate_game_combo(game_id)
-                self._populate_route_combo(game_id, route_id)
+                self._populate_tree_combo(game_id, tree_id)
                 self._commit_route_selection(initial=True)
                 return True
-            if not self.current_game_id or not self.current_route_id:
-                game_id = games[0]["id"]
-                routes = self.db.list_routes(game_id)
-                route_id = routes[0]["id"] if routes else self.db.add_route(game_id, "默认线路", notes="")
+            if not self.current_tree_id:
+                game_id = self.cmb_game.currentData() or games[0]["id"]
+                trees = self.db.list_story_trees(game_id)
+                if not trees:
+                    QMessageBox.information(
+                        self,
+                        "还没有剧情树",
+                        "请先在游戏管理里为这个游戏新建一棵剧情树，再开始识别。",
+                    )
+                    return False
                 self.current_game_id = game_id
-                self.current_route_id = route_id
+                self.current_tree_id = trees[0]["id"]
                 self._populate_game_combo(game_id)
-                self._populate_route_combo(game_id, route_id)
+                self._populate_tree_combo(game_id, trees[0]["id"])
                 self._commit_route_selection(initial=True)
                 return True
-        except Exception as e:
-            QMessageBox.warning(self, "初始化线路失败", f"创建默认游戏/线路时出错：{e}")
+        except Exception as exc:
+            QMessageBox.warning(self, "初始化失败", f"准备剧情树时出错：{exc}")
             return False
         return True
 
@@ -4151,7 +4429,7 @@ class MainWindow(QMainWindow):
         self._switch_page(5)
 
     def _on_game_combo_changed(self):
-        self._populate_route_combo(self.cmb_game.currentData())
+        self._populate_tree_combo(self.cmb_game.currentData())
         self._commit_route_selection()
 
     def _on_route_combo_changed(self):
@@ -4159,43 +4437,74 @@ class MainWindow(QMainWindow):
 
     def _commit_route_selection(self, initial: bool = False):
         game_id = self.cmb_game.currentData()
-        route_id = self.cmb_route.currentData()
-        changed = route_id != self.current_route_id
+        tree_id = self.cmb_route.currentData()
+        tree = self.db.get_story_tree(tree_id) if tree_id else None
+        anchor_id = tree.get("anchor_route_id") if tree else None
+        changed = tree_id != self.current_tree_id
         self.current_game_id = game_id
-        self.current_route_id = route_id
+        self.current_tree_id = tree_id
+        self.current_route_id = anchor_id
         self.config["last_game_id"] = game_id
-        self.config["last_route_id"] = route_id
+        self.config["last_tree_id"] = tree_id
+        self.config["last_route_id"] = anchor_id
         if not initial:
             self._save_config()
         if changed and not initial:
-            # 切换线路后清空旧的内容
             self.txt_log.clear()
             self.txt_summary.clear()
             self.txt_current.clear()
             with self.buffer_lock:
                 self.text_buffer.clear()
         self._load_previous_summary()
-        self.timeline_page.set_route(route_id)
-        self.keyinfo_page.set_route(route_id)
+        self.story_page.set_tree(tree_id)
+        self.keyinfo_page.set_route(anchor_id)
 
     def _on_game_data_changed(self):
         """游戏管理页发生增删改后，刷新左上方下拉框并保持当前选择"""
         self._populate_game_combo(self.current_game_id)
-        self._populate_route_combo(self.cmb_game.currentData(), self.current_route_id)
+        self._populate_tree_combo(self.cmb_game.currentData(), self.current_tree_id)
         self._commit_route_selection()
 
-    def _on_route_chosen(self, game_id: int, route_id: int):
-        """在游戏管理页点击“设为当前线路”"""
+    def _on_tree_chosen(self, game_id: int, tree_id: int):
+        """在游戏管理页点击“设为当前剧情树”"""
         self._populate_game_combo(game_id)
-        self._populate_route_combo(game_id, route_id)
+        self._populate_tree_combo(game_id, tree_id)
         self._commit_route_selection()
+
+    def _summarize_allowed(self) -> bool:
+        return bool(self.current_tree_id) and self.db.story_can_record(self.current_tree_id)
+
+    def _sync_summarize_buttons(self):
+        allowed = self._summarize_allowed()
+        self.btn_summarize_main.setEnabled(allowed and not self._summarizing)
+        if allowed:
+            self.btn_summarize_main.setToolTip("立即总结当前已累计的文本")
+        else:
+            self.btn_summarize_main.setToolTip("请先在剧情树上设置总结时点")
+        if self._summarizing and not self._queue_mode:
+            self.status_window.btn_summarize.setEnabled(False)
+        else:
+            self.status_window.btn_summarize.setEnabled(allowed)
+
+    def _plot_context_limit(self) -> int:
+        try:
+            limit = int(self.config.get("plot_context_limit", 12000))
+        except (TypeError, ValueError):
+            return 12000
+        return limit if 1000 <= limit <= 100000 else 12000
 
     def _load_previous_summary(self):
-        if self.current_route_id:
-            last = self.db.get_last_summary_for_route(self.current_route_id)
-            self.previous_summary = last["content"] if last else ""
+        if self.current_tree_id:
+            self.previous_summary = self.db.build_plot_context(
+                self.current_tree_id, self._plot_context_limit()
+            )
         else:
             self.previous_summary = ""
+        if hasattr(self, "btn_summarize_main"):
+            self._sync_summarize_buttons()
+
+    def _on_story_cursor_changed(self):
+        self._load_previous_summary()
 
     # ------------------------------------------------------------------
     # 区域选择
@@ -4206,6 +4515,8 @@ class MainWindow(QMainWindow):
         for screen in QGuiApplication.screens():
             selector = RegionSelector(screen.geometry())
             selector.selected.connect(self._on_region_selected)
+            selector.setScreen(screen)
+            selector.setGeometry(screen.geometry())
             selector.showFullScreen()
             self._selectors.append(selector)
 
@@ -4252,11 +4563,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # 设置
     # ------------------------------------------------------------------
-    def _on_timeline_reordered(self):
-        if self._summarizing or not self.current_route_id:
-            return
-        self._load_previous_summary()
-
     def _on_settings_saved(self):
         self.llm_client = LLMClient(self.config)
         new_theme = self.config.get("theme", "dark")
@@ -4278,7 +4584,7 @@ class MainWindow(QMainWindow):
             return
         self._queue_mode = new_mode
         self._reset_queue_state()
-        self._queue_route_id = None
+        self._queue_tree_id = None
         self.card_queue.setVisible(new_mode)
         if new_mode:
             if self._queue_tab_index < 0:
@@ -4297,6 +4603,8 @@ class MainWindow(QMainWindow):
         self.status_window.refresh_theme()
         self._set_status(self.lbl_status.text())
         self.region_indicator.update()
+        if hasattr(self, "story_page"):
+            self.story_page.reload()
 
     # ------------------------------------------------------------------
     # 状态浮窗
@@ -4407,9 +4715,9 @@ class MainWindow(QMainWindow):
         self._prepare_ocr_transcript()
         if self._queue_mode:
             # 换线路才清空；同线路暂停后继续时保留未总结的帧文本与排队任务
-            if self._queue_route_id != self.current_route_id:
+            if self._queue_tree_id != self.current_tree_id:
                 self._reset_queue_state()
-            self._queue_route_id = self.current_route_id
+            self._queue_tree_id = self.current_tree_id
             self.ocr_worker = QueuedOCRWorker(
                 self.region,
                 self.config.get("ocr_interval_ms", 1500),
@@ -4701,6 +5009,13 @@ class MainWindow(QMainWindow):
 
     def _enqueue_summary_task(self, anchor_frame_id: Optional[int] = None) -> bool:
         """以「点击瞬间最新已入队帧的前一帧」为锚点，把一段剧情加入总结队列。"""
+        if not self._summarize_allowed():
+            if not getattr(self, "_cursor_warned", False):
+                self.txt_log.append("[总结] 未设置总结时点，已跳过。")
+                self.toasts.show("请先在剧情树上设置总结时点", kind="warn", duration_ms=3000)
+                self._cursor_warned = True
+            return False
+        self._cursor_warned = False
         if anchor_frame_id is not None:
             anchor = anchor_frame_id
         elif isinstance(self.ocr_worker, QueuedOCRWorker):
@@ -4991,20 +5306,26 @@ class MainWindow(QMainWindow):
                 self.tbl_queue.setCellWidget(row, 4, btn)
 
     def _game_prompt(self) -> str:
-        """当前游戏的追加提示词（总结/信息提取时拼入 system prompt）"""
-        if not self.current_game_id:
-            return ""
-        game = self.db.get_game(self.current_game_id)
-        if game:
-            return game.get("prompt") or ""
-        return ""
+        """游戏提示词，再加上当前剧情树的补充说明。"""
+        parts = []
+        if self.current_game_id:
+            game = self.db.get_game(self.current_game_id)
+            text = ((game or {}).get("prompt") or "").strip()
+            if text:
+                parts.append(text)
+        if self.current_tree_id:
+            tree = self.db.get_story_tree(self.current_tree_id)
+            text = ((tree or {}).get("prompt") or "").strip()
+            if text:
+                parts.append(text)
+        return "\n\n".join(parts)
 
     def _shared_knowledge_prompt(self) -> tuple:
-        """当前游戏已共享的线索、世界观、角色，以及当前线路名。"""
+        """共享设定，以及时点所在线路的名称。还在主链上时用剧情树名。"""
         if not self.current_route_id:
             return "", ""
-        route = self.db.get_route(self.current_route_id) or {}
-        return self.db.format_shared_context(self.current_route_id), route.get("name") or ""
+        label = self.db.story_route_label(self.current_tree_id) if self.current_tree_id else ""
+        return self.db.format_shared_context(self.current_route_id), label
 
     def _summary_system_prompt(self) -> str:
         try:
@@ -5017,6 +5338,12 @@ class MainWindow(QMainWindow):
         return SUMMARY_PROMPT_BRIEF
 
     def _trigger_summary(self, session_id: Optional[int] = None):
+        if not self._summarize_allowed():
+            if not getattr(self, "_cursor_warned", False):
+                self.txt_log.append("[总结] 未设置总结时点，已跳过。请在剧情树上设置时点。")
+                self._cursor_warned = True
+            return
+        self._cursor_warned = False
         with self.buffer_lock:
             if not self.text_buffer or self._summarizing:
                 return
@@ -5051,6 +5378,13 @@ class MainWindow(QMainWindow):
         self.summary_thread.start()
 
     def _manual_summarize(self):
+        if not self._summarize_allowed():
+            QMessageBox.information(
+                self,
+                "未设置总结时点",
+                "请先打开剧情树，选中位置后点「设为总结时点」。空树可以直接总结第一段。",
+            )
+            return
         if self._queue_mode:
             # 队列模式：以点击瞬间的锚点入队，等该段识别完成后再总结
             self._enqueue_summary_task()
@@ -5133,54 +5467,62 @@ class MainWindow(QMainWindow):
         # 新建
         self.db.add_or_update_character(route_id, name=name, info=info)
 
-    def _summary_insert_at(self, task: SummaryTask) -> Optional[int]:
-        """失败重试时，插到比它更晚、且已经写进库的那段之前。没有更晚的就追加。"""
+    def _summary_insert_before(self, task: Optional[SummaryTask]) -> Optional[int]:
+        """重试时，插到比它更晚、且已经写进剧情树的那段之前。"""
+        if task is None:
+            return None
         later_ids = [
-            other.summary_id
+            other.node_id
             for other in self._summary_task_log
-            if other is not task and other.summary_id and other.queue_seq > task.queue_seq
+            if other is not task and other.node_id and other.queue_seq > task.queue_seq
         ]
         if not later_ids:
             return None
-        return self.db.min_summary_sort_order(later_ids)
+        return self.db.earliest_story_node(later_ids)
 
     def _on_summary_ready(self, summary: str, raw_text: str, key_info_json: str, title: str = ""):
         self._summarizing = False
-        self.btn_summarize_main.setEnabled(True)
         self._inflight_summary_text = ""
         task = self._current_summary_task
-        insert_at = self._summary_insert_at(task) if task is not None else None
+        before_id = self._summary_insert_before(task)
 
-        # 持久化总结
-        summary_id = None
-        session_id = getattr(self, "_summary_session_id", None) or self._current_session_id or self._last_session_id
-        self._summary_session_id = None
-        if self.current_route_id:
-            if not session_id:
-                # 暂停后手动总结等没有活动会话的情况：补建一个已结束的会话承载这条总结
-                session_id = self.db.start_session(self.current_route_id)
-                self.db.pause_session(session_id)
-            summary_id = self.db.add_summary(
-                self.current_route_id,
-                session_id,
-                "periodic",
-                summary,
-                raw_text,
-                title=title,
-                insert_at=insert_at,
-            )
-            last = self.db.get_last_summary_for_route(self.current_route_id)
-            self.previous_summary = (last or {}).get("content") or summary
-        else:
-            self.previous_summary = summary
+        node_id = None
+        try:
+            if not self.current_tree_id:
+                raise StoryTreeError("请先选择剧情树")
+            if before_id:
+                node_id = self.db.insert_beat_before(
+                    self.current_tree_id, before_id, summary, title=title, raw_text=raw_text
+                )
+            else:
+                node_id = self.db.insert_beat_at_cursor(
+                    self.current_tree_id, summary, title=title, raw_text=raw_text
+                )
+        except StoryTreeError as exc:
+            self.txt_log.append(f"[总结] 未能写入剧情树：{exc}")
+            self.toasts.show(str(exc), kind="warn", duration_ms=5000)
+            if task is not None:
+                task.state = "失败"
+                task.error = str(exc)
+                self._current_summary_task = None
+            self._load_previous_summary()
+            self._set_summary_status("总结失败")
+            self.status_window.update_summary_state("总结失败")
+            if self._queue_mode:
+                self._update_queue_ui()
+                self._pump_summary_queue()
+            return
+
+        self.previous_summary = self.db.build_plot_context(
+            self.current_tree_id, self._plot_context_limit()
+        )
         if task is not None:
-            task.summary_id = summary_id
+            task.node_id = node_id
             task.state = "已完成"
             task.raw_text = ""
             task.error = ""
             self._current_summary_task = None
 
-        # 持久化关键信息
         try:
             key_info_list = json.loads(key_info_json)
         except Exception:
@@ -5189,25 +5531,22 @@ class MainWindow(QMainWindow):
             game_id = self.db.game_id_of_route(self.current_route_id)
             for item in key_info_list:
                 try:
-                    self._apply_extracted_key_info(item, summary_id, game_id)
+                    self._apply_extracted_key_info(item, None, game_id)
                 except Exception:
                     pass
 
         now_str = datetime.datetime.now().strftime("%H:%M:%S")
         self.txt_summary.append(f"[{now_str}] {summary}\n")
 
-        # 总结完成反馈
         chapter = title.strip() if title else ""
         if chapter:
             self.toasts.show(f"「{chapter}」已总结完成", kind="ok", duration_ms=5000)
         else:
             self.toasts.show("本段剧情已总结完成", kind="ok", duration_ms=5000)
         self._show_summary_done()
-
-        # 若当前正在查看剧情总结 / 关键信息页面，实时刷新
-        if self.stack.currentIndex() == 1:
-            self.timeline_page.reload()
-        elif self.stack.currentIndex() == 2:
+        self.story_page.reload()
+        self._sync_summarize_buttons()
+        if self.stack.currentIndex() == 2:
             self.keyinfo_page.reload()
 
         if self._queue_mode:
@@ -5233,7 +5572,7 @@ class MainWindow(QMainWindow):
 
     def _on_summary_error(self, msg: str):
         self._summarizing = False
-        self.btn_summarize_main.setEnabled(True)
+        self._sync_summarize_buttons()
         if self._current_summary_task is not None:
             self._current_summary_task.state = "失败"
             self._current_summary_task.error = msg
@@ -5286,6 +5625,22 @@ class MainWindow(QMainWindow):
     def _update_today_time(self):
         seconds = self.db.today_seconds()
         self.lbl_today.setText(fmt_duration(seconds))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if self._fixing_size:
+            return
+        if (
+            self._title_dragging
+            and self._stable_size is not None
+            and event.size() != self._stable_size
+        ):
+            self._fixing_size = True
+            self.resize(self._stable_size)
+            self._fixing_size = False
+            return
+        if not self._title_dragging:
+            self._stable_size = event.size()
 
     # ------------------------------------------------------------------
     # 关闭
